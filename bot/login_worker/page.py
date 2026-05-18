@@ -14,6 +14,7 @@ from playwright.async_api import Error as PlaywrightError
 from .config import (
     _ACCOUNT_LOCKED_MARKERS,
     _CAPTCHA_MARKERS,
+    _UNSAFE_BROWSER_MARKERS,
     _UNUSUAL_ACTIVITY_MARKERS,
     _WRONG_PASSWORD_MARKERS,
     DEBUG_SCREENSHOTS,
@@ -148,6 +149,8 @@ async def _detect_challenge(page: Any) -> str | None:
         return "WRONG_PASSWORD"
     if _check_markers(text, _ACCOUNT_LOCKED_MARKERS):
         return "ACCOUNT_LOCKED"
+    if _check_markers(text, _UNSAFE_BROWSER_MARKERS):
+        return "UNSAFE_BROWSER"
     if _check_markers(text, _CAPTCHA_MARKERS):
         return "CAPTCHA"
     if _check_markers(text, _UNUSUAL_ACTIVITY_MARKERS):

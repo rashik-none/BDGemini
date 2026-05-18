@@ -4,22 +4,27 @@ from __future__ import annotations
 
 import logging
 import random
-import sys
+import re
 from contextlib import asynccontextmanager
 from typing import Any
+
+from playwright.async_api import ProxySettings, async_playwright
 
 from .config import (
     BLOCK_HEAVY_RESOURCES,
     BLOCK_TRACKERS,
     BLOCKED_RESOURCE_TYPES,
+    ANDROID_VIEWPORT,
+    ANDROID_DPR,
 )
-
-# config.py already inserts invisible_playwright/src into sys.path
-from invisible_playwright.async_api import InvisiblePlaywright
 
 logger = logging.getLogger(__name__)
 
-# ── Resource blocking ───────────────────────────────────────────────────────
+# ── Pixel 10 Pro identity ────────────────────────────────────────────────────
+# Matches device_profiles.py PIXEL_10_PRO exactly.
+_DEFAULT_CHROMIUM_VERSION = "136.0.0.0"
+
+# ── Resource blocking ────────────────────────────────────────────────────────
 
 _TRACKER_URL_MARKERS = (
     "google-analytics",
@@ -62,6 +67,77 @@ def _should_block_request(url: str, resource_type: str) -> bool:
     return False
 
 
+def _normalize_chromium_version(version: str) -> str:
+    match = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?", str(version).strip())
+    if not match:
+        return _DEFAULT_CHROMIUM_VERSION
+    return ".".join(part if part is not None else "0" for part in match.groups())
+
+
+def _chrome_major(version: str) -> str:
+    return _normalize_chromium_version(version).split(".", 1)[0]
+
+
+def _pixel_android_user_agent(chromium_version: str) -> str:
+    version = _normalize_chromium_version(chromium_version)
+    return (
+        "Mozilla/5.0 (Linux; Android 10; K) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{version} Mobile Safari/537.36"
+    )
+
+
+def _pixel_client_hints(chromium_version: str) -> dict[str, str]:
+    version = _normalize_chromium_version(chromium_version)
+    major = _chrome_major(version)
+    return {
+        "sec-ch-ua": (
+            f'"Chromium";v="{major}", '
+            f'"Google Chrome";v="{major}", '
+            '"Not-A.Brand";v="99"'
+        ),
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"Android"',
+        "sec-ch-ua-platform-version": '"16.0.0"',
+        "sec-ch-ua-model": '"Pixel 10 Pro"',
+        "sec-ch-ua-full-version-list": (
+            f'"Chromium";v="{version}", '
+            f'"Google Chrome";v="{version}", '
+            '"Not-A.Brand";v="99.0.0.0"'
+        ),
+    }
+
+
+def _build_playwright_proxy(proxy: dict[str, str] | None) -> ProxySettings | None:
+    if not proxy:
+        return None
+
+    server = (proxy.get("server") or "").strip()
+    if not server or server.lower() == "direct://":
+        return None
+
+    pw_proxy: ProxySettings = {"server": server}
+    if proxy.get("username"):
+        pw_proxy["username"] = proxy["username"]
+    if proxy.get("password"):
+        pw_proxy["password"] = proxy["password"]
+    return pw_proxy
+
+
+def _build_android_context_kwargs(chromium_version: str) -> dict[str, Any]:
+    return {
+        "user_agent": _pixel_android_user_agent(chromium_version),
+        "viewport": ANDROID_VIEWPORT,
+        "device_scale_factor": ANDROID_DPR,
+        "is_mobile": True,
+        "has_touch": True,
+        "locale": "en-US",
+        "timezone_id": "Asia/Dhaka",
+        "extra_http_headers": _pixel_client_hints(chromium_version),
+        "ignore_https_errors": True,
+    }
+
+
 async def _block_heavy_resources(context: Any) -> None:
     """Block heavy/tracking requests while protecting Google critical paths."""
     if not BLOCK_HEAVY_RESOURCES and not BLOCK_TRACKERS:
@@ -81,78 +157,127 @@ async def _block_heavy_resources(context: Any) -> None:
     await context.route("**/*", route_handler)
 
 
-# ── Timing helper ───────────────────────────────────────────────────────────
+# ── Timing helper ────────────────────────────────────────────────────────────
 
 async def _random_pause(page: Any, lo: int = 300, hi: int = 900) -> None:
     """Introduce a human-like pause between actions."""
     await page.wait_for_timeout(random.randint(lo, hi))
 
 
-# ── Browser launcher ────────────────────────────────────────────────────────
+# ── Browser launcher ─────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def _launch_android_browser(proxy: dict[str, str] | None):
-    """Launch InvisiblePlaywright (patched Firefox) for maximum stealth.
+    """Launch standard Playwright Chromium with Pixel 10 Pro mobile emulation.
 
-    WHY FIREFOX, NOT CHROME?
-    ─────────────────────────
-    Regular Playwright Chromium is trivially detected by Google:
-      • navigator.webdriver = true (even with flags)
-      • headless-specific timing, GPU & rendering signatures
-      • No real plugin/codec fingerprint
+    DIAGNOSTIC MODE — using standard Playwright instead of invisible_playwright
+    to isolate whether the 'unsafe browser' error is caused by the patched
+    Firefox binary or by the proxy / account itself.
 
-    invisible_playwright patches Firefox at the C++ level (Gecko source),
-    not via JS overrides. reCAPTCHA v3 score: 0.90/1.0 vs ~0.3-0.5
-    for patched Chromium. Google classifies the session as "very likely human".
+    Anti-detection measures applied:
+      • --disable-blink-features=AutomationControlled  → navigator.webdriver = false
+      • Pixel 10 Pro UA + Client Hints headers
+      • Mobile viewport (410×914, DPR 3.125)
+      • is_mobile=True, has_touch=True
+      • Locale en-US, timezone Asia/Dhaka
+      • ignore_https_errors=True  (handles proxy MITM CA)
 
-    HEADLESS ON WINDOWS
-    ────────────────────
-    invisible_playwright uses _WindowsVirtualDesktop (CreateDesktop via
-    pywin32/ctypes) to run Firefox headed on a hidden desktop — it avoids
-    the divergent code paths that headless=True triggers inside Gecko,
-    which are fingerprinted by anti-bot systems.
-    Requires: pywin32  (pip install pywin32)
-
-    MOBILE SPOOFING
-    ────────────────
-    Firefox does NOT support Playwright's is_mobile / has_touch context
-    options. We spoof mobile identity via:
-      • general.useragent.override pref  (UA string)
-      • sec-ch-ua / sec-ch-ua-mobile headers  (Client Hints)
-      • viewport + device_scale_factor  (screen size)
-    This is sufficient for Google's login and offer-claim flows.
+    TO SWITCH BACK to invisible_playwright, replace this function body with
+    the InvisiblePlaywright launcher in the git history.
     """
-    extra_prefs: dict[str, Any] = {
-        # ── SSL / Proxy MITM bypass ───────────────────────────────────────
-        # Bright Data (and most residential proxies) perform HTTPS inspection
-        # by substituting their own CA cert. These prefs allow that.
-        # NOTE: telemetry, safebrowsing, update, and mobile-UA prefs are
-        # already set by _BASELINE and the pixel_10_pro device profile —
-        # they are NOT repeated here to avoid duplicated constants drifting.
-        "network.stricttransportsecurity.preloadlist": False,
-        "security.cert_pinning.enforcement_level": 0,
-        "security.mixed_content.block_active_content": False,
-        "security.mixed_content.block_display_content": False,
-        # Trust the OS/system root certificates (catches proxy CAs installed
-        # at the Windows certificate store level by Bright Data client)
-        "security.enterprise_roots.enabled": True,
-    }
+    pw_proxy = _build_playwright_proxy(proxy)
 
-    try:
-        is_windows = sys.platform == "win32"
-        ipl = InvisiblePlaywright(
-            proxy=proxy,
-            device_profile="pixel_10_pro",
-            # Windows: SetThreadDesktop fails in asyncio thread, so we launch minimized.
-            # Linux (VPS): Xvfb works perfectly, so we use true headless mode.
-            headless=not is_windows,
-            extra_args=["-min"] if is_windows else [],
-            locale="en-US",
-            timezone="Asia/Dhaka",
-            extra_prefs=extra_prefs,
-            humanize=True,         # Bezier-curve mouse motion baked in binary
+    # Chromium launch args to minimise automation and headless signals
+    launch_args = [
+        "--headless=new",                        # new headless = much harder to detect
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-infobars",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--disable-translate",
+        "--disable-default-apps",
+        "--mute-audio",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-popup-blocking",
+        "--disable-client-side-phishing-detection",
+        "--disable-component-update",
+        "--disable-domain-reliability",
+        "--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins",
+        "--lang=en-US",
+        # Headless anti-detection
+        "--window-size=410,914",
+        "--hide-scrollbars",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+    ]
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=launch_args,
+            proxy=pw_proxy,
         )
-        async with ipl as browser:
-            yield browser
-    except Exception:
-        raise
+        try:
+            context = await browser.new_context(**_build_android_context_kwargs(browser.version))
+            await context.add_init_script("""
+                // Remove webdriver flag
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                    configurable: true,
+                });
+                // Restore window.chrome (missing in headless)
+                window.chrome = {
+                    runtime: {},
+                    loadTimes: function(){},
+                    csi: function(){},
+                    app: {},
+                };
+                // Plugins (headless has none — spoof empty array)
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [],
+                });
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'],
+                });
+                // Remove headless-specific properties
+                delete navigator.__proto__.webdriver;
+                // Permissions API — headless returns 'denied' for notifications
+                // Make it return 'default' like a real browser
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) =>
+                    parameters.name === 'notifications'
+                        ? Promise.resolve({ state: 'default' })
+                        : originalQuery(parameters);
+            """)
+            # Yield a fake "browser" object whose new_context() returns this context
+            # We wrap it so runner.py's `browser.new_context()` call works.
+            yield _ContextAsNewContextBrowser(browser, context)
+        finally:
+            await browser.close()
+
+
+class _ContextAsNewContextBrowser:
+    """Thin shim so runner.py's `browser.new_context()` returns our pre-built
+    context (with init scripts and mobile settings already applied).
+
+    Runner calls:
+        context = await browser.new_context()
+        page    = await context.new_page()
+    We return our already-configured context on the first call.
+    """
+
+    def __init__(self, browser: Any, context: Any) -> None:
+        self._browser = browser
+        self._context = context
+        self._used = False
+
+    async def new_context(self, **_kwargs: Any) -> Any:
+        if not self._used:
+            self._used = True
+            return self._context
+        # Subsequent calls (shouldn't happen) fall through to real browser
+        return await self._browser.new_context(**_kwargs)

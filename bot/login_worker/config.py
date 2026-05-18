@@ -74,9 +74,18 @@ _ACCOUNT_LOCKED_MARKERS = [
     "Your account has been suspended",
     "Account disabled",
 ]
+_UNSAFE_BROWSER_MARKERS = [
+    # Google shows all three on the same error page:
+    # title: "Couldn't sign you in"
+    # body:  "This browser or app may not be secure. Try using a different browser."
+    "Couldn't sign you in",
+    "This browser or app may not be secure",
+    "browser or app may not be secure",
+    "Try using a different browser",
+    "this browser or app",
+]
 _UNUSUAL_ACTIVITY_MARKERS = [
     "unusual activity",
-    "Couldn't sign you in",
     "verify it's you",
     "Confirm your identity",
 ]

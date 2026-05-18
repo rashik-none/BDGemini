@@ -79,9 +79,7 @@ class GoogleLoginNavigationTests(unittest.IsolatedAsyncioTestCase):
     def test_google_login_url_is_well_formed(self) -> None:
         url = google_login._google_login_url()
 
-        self.assertTrue(url.startswith("https://accounts.google.com/signin/v2/identifier?"))
-        self.assertIn("flowName=GlifWebSignIn", url)
-        self.assertIn("continue=https%3A%2F%2Fone.google.com%2F", url)
+        self.assertEqual(url, "https://one.google.com/")
 
     async def test_goto_google_login_accepts_rendered_email_page_after_timeout(self) -> None:
         page = _FakeLoginPage(email_visible=True)

@@ -351,7 +351,7 @@ def job_detail_message(job: dict) -> str:
 
     note = job.get("progress_note", "")
     if note:
-        lines.extend(["", f"📝 {escape(str(note))}"])
+        lines.extend(["", f"📝 Progress note: {escape(str(note))}"])
 
     redeem = job.get("redeem_link", "")
     if redeem:

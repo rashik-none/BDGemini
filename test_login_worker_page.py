@@ -19,8 +19,25 @@ class PageHelperTests(unittest.TestCase):
     def test_check_markers_is_case_insensitive(self) -> None:
         self.assertTrue(page._check_markers("Wrong Password", ["wrong password"]))
 
+    def test_detect_challenge_identifies_unsafe_browser_before_unusual_activity(self) -> None:
+        class FakePage:
+            async def inner_text(self, selector: str) -> str:
+                return (
+                    "Couldn't sign you in\n"
+                    "This browser or app may not be secure. Try using a different browser."
+                )
+
+        result = self._run(page._detect_challenge(FakePage()))
+
+        self.assertEqual(result, "UNSAFE_BROWSER")
+
     def test_redact_sensitive_handles_non_string_text(self) -> None:
         self.assertEqual(page._redact_sensitive(123, "2"), "1[redacted]3")
+
+    def _run(self, coro):
+        import asyncio
+
+        return asyncio.run(coro)
 
 
 if __name__ == "__main__":

@@ -62,6 +62,33 @@ def _retry_reason(result: str) -> str:
     return "login_flow_failed"
 
 
+async def _fail_unsafe_browser(
+    telegram_id: str,
+    job_id: str,
+    bot: Any,
+    chat_id: int,
+) -> None:
+    await _update_job_status(
+        telegram_id,
+        job_id,
+        "FAILED",
+        {
+            "progress": 100,
+            "progress_note": "Google rejected this browser or app",
+            "error": "unsafe_browser",
+        },
+    )
+    await _refund_job(telegram_id, job_id)
+    await _notify(
+        bot,
+        chat_id,
+        f"❌ <b>Job {html_esc(job_id)}</b>\n\n"
+        "<b>Job failed</b>\n"
+        "Google rejected this browser or app as not secure.\n\n"
+        "↩️ 1 credit has been refunded to your balance.",
+    )
+
+
 async def _do_login_attempt(
     gmail: str,
     password: str,
@@ -93,16 +120,13 @@ async def _do_login_attempt(
     )
 
     async with _launch_android_browser(proxy) as browser:
-        # Firefox (invisible_playwright) does NOT support is_mobile / has_touch.
-        # Mobile UA is already injected via general.useragent.override pref.
-        # NOTE: ignore_https_errors is also NOT supported by Firefox Playwright
-        #   (throws NS_ERROR_NOT_AVAILABLE). SSL bypass is done via prefs in browser.py.
+        # Standard Playwright Chromium with Pixel 10 Pro mobile emulation.
+        # new_context() returns our pre-configured context (UA, viewport,
+        # Client Hints, webdriver=undefined init script already applied).
         context = await browser.new_context()
         try:
             if proxy:
                 await _block_heavy_resources(context)
-            # No _add_stealth needed — invisible_playwright patches at C++ level.
-            # JS overrides would be detectable and hurt reCAPTCHA scores.
             page = await context.new_page()
             # Residential proxy can be slow — raise all page-level timeouts.
             page.set_default_navigation_timeout(90_000)  # 90 s
@@ -243,13 +267,16 @@ async def _do_login_attempt(
                 {"PASSWORD", "SUCCESS"},
                 timeout=30000,
             )
-            if login_state in {"WRONG_PASSWORD", "ACCOUNT_LOCKED", "CAPTCHA", "UNUSUAL_ACTIVITY"}:
+            if login_state in {"WRONG_PASSWORD", "ACCOUNT_LOCKED", "UNSAFE_BROWSER", "CAPTCHA", "UNUSUAL_ACTIVITY"}:
                 await _screenshot(page, job_id, f"03_challenge_{login_state}")
                 await _notify(
                     bot, chat_id,
                     f"⚠️ <b>Job {html_esc(job_id)}</b>\n"
                     f"Challenge after email: <code>{login_state}</code>",
                 )
+                if login_state == "UNSAFE_BROWSER":
+                    await _fail_unsafe_browser(telegram_id, job_id, bot, chat_id)
+                    return ATTEMPT_TERMINAL
                 return _retry(f"Challenge after email: {login_state}")
 
             # ── 3. Password ───────────────────────────────────────────
@@ -342,13 +369,16 @@ async def _do_login_attempt(
                         "Trying again with a fresh browser session.",
                     )
                     return _retry(f"Password step failed: {last_error[:160]}")
-                if login_state in {"WRONG_PASSWORD", "ACCOUNT_LOCKED", "CAPTCHA", "UNUSUAL_ACTIVITY"}:
+                if login_state in {"WRONG_PASSWORD", "ACCOUNT_LOCKED", "UNSAFE_BROWSER", "CAPTCHA", "UNUSUAL_ACTIVITY"}:
                     await _screenshot(page, job_id, f"05_challenge_{login_state}")
                     await _notify(
                         bot, chat_id,
                         f"⚠️ <b>Job {html_esc(job_id)}</b>\n"
                         f"Challenge after password: <code>{login_state}</code>",
                     )
+                    if login_state == "UNSAFE_BROWSER":
+                        await _fail_unsafe_browser(telegram_id, job_id, bot, chat_id)
+                        return ATTEMPT_TERMINAL
                     if login_state == "WRONG_PASSWORD":
                         await _update_job_status(
                             telegram_id,
@@ -535,6 +565,11 @@ async def _do_login_attempt(
                     await page.wait_for_timeout(3000)
 
             # ── 5. Result check ────────────────────────────────────────
+            if login_state == "UNSAFE_BROWSER":
+                await _screenshot(page, job_id, "07_unsafe_browser")
+                await _fail_unsafe_browser(telegram_id, job_id, bot, chat_id)
+                return ATTEMPT_TERMINAL
+
             await page.wait_for_timeout(3000)
             current_url = page.url
             await _screenshot(page, job_id, "07_result")
@@ -581,6 +616,7 @@ async def _do_login_attempt(
                     await _notify(
                         bot, chat_id,
                         f"▶️ <b>Job {html_esc(job_id)}</b>\n"
+                        f"Offer result: <code>{html_esc(claim_result)}</code>\n"
                         "1 credit has been refunded to your balance.",
                     )
 

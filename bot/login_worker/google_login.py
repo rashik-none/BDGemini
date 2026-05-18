@@ -30,56 +30,63 @@ async def _wait_for_navigation(page: Any, timeout: int = 5000) -> None:
 
 
 def _google_login_url() -> str:
-    query = urlencode(
-        {
-            "flowName": "GlifWebSignIn",
-            "flowEntry": "ServiceLogin",
-            "continue": "https://one.google.com/",
-            "hl": "en",
-        }
-    )
-    return f"https://accounts.google.com/signin/v2/identifier?{query}"
+    # Navigate to accounts.google.com directly.
+    #
+    # WHY NOT one.google.com?
+    # ────────────────────────────────────────────────────────────
+    # When the bot goes to one.google.com while unauthenticated, Google may
+    # serve the anonymous pricing/plans page ("Choose the Google One plan")
+    # WITHOUT always redirecting to accounts.google.com — especially when
+    # using a proxy or a fresh cookie jar that Google doesn't trust yet.
+    # That anonymous page was being incorrectly classified as a login SUCCESS
+    # because one.google.com was listed in _is_google_login_success_url().
+    #
+    # Going straight to accounts.google.com/signin guarantees we always land
+    # on the email-input form, which is the correct starting state.
+    return "https://accounts.google.com/signin/v2/identifier?hl=en"
 
 
 async def _goto_google_login(page: Any, attempts: int = GOOGLE_LOGIN_ATTEMPTS) -> None:
-    """Open Google's login page with robust navigation handling.
+    """Navigate to accounts.google.com and wait for the email-input form.
 
     Strategy:
-      1. Try fast 'commit' (fires as soon as server response bytes arrive).
-         Works even when the full page load is slow or SSL is intercepted.
-      2. If 'commit' times out, try 'domcontentloaded' as a fallback.
-      3. After any successful goto, wait for the email input OR success URL
-         so we know the page is actually usable.
+      1. Navigate to accounts.google.com/signin — this always shows the
+         email form for unauthenticated users.
+      2. Wait for domcontentloaded, then check state.
+      3. Retry on timeout.
     """
-    url = _google_login_url()
+    url = _google_login_url()   # accounts.google.com/signin/v2/identifier
     last_error: Exception | None = None
 
     for attempt in range(attempts):
-        # ── Phase 1: commit (fastest — fires on first response bytes) ──
         try:
             await page.goto(
                 url,
                 wait_until="commit",
                 timeout=LOGIN_NAVIGATION_TIMEOUT_MS,
             )
-            # Give the page a moment to start rendering, then check state
-            await page.wait_for_timeout(3000)
-            state = await _google_login_state(page)
-            if state != "UNKNOWN":
-                return
-            # Page committed but content not ready yet — wait a bit more
+            # Wait for domcontentloaded on whatever page we land on.
             try:
-                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
             except Exception:
                 pass
+
+            await page.wait_for_timeout(2000)
             state = await _google_login_state(page)
             if state != "UNKNOWN":
                 return
-            # Still unknown — raise to trigger outer retry
-            raise PlaywrightTimeoutError("Page loaded but Google login UI not found")
+
+            # Give one final generous wait before giving up
+            await page.wait_for_timeout(5000)
+            state = await _google_login_state(page)
+            if state != "UNKNOWN":
+                return
+
+            raise PlaywrightTimeoutError(
+                "Navigated to Google login but email form did not appear"
+            )
         except PlaywrightTimeoutError as exc:
             last_error = exc
-            # Check if the page partially loaded anyway
             state = await _google_login_state(page)
             if state != "UNKNOWN":
                 return
@@ -97,14 +104,22 @@ async def _goto_google_login(page: Any, attempts: int = GOOGLE_LOGIN_ATTEMPTS) -
 
 
 def _is_google_login_success_url(url: str) -> bool:
+    """Return True only when the page has settled on a confirmed logged-in Google URL.
+
+    one.google.com is intentionally EXCLUDED here because the bot now starts
+    navigation at accounts.google.com. After credentials are submitted Google
+    redirects to myaccount.google.com or mail.google.com — those are safe
+    success signals. one.google.com is checked separately by the offer-claim
+    flow using _google_one_authenticated_page() which verifies the Sign-in
+    CTA is absent, preventing false positives on the anonymous plans page.
+    """
     try:
         parsed = urlparse(url)
     except Exception:
         return False
 
     host = parsed.netloc.lower()
-    if host == "one.google.com" or host.endswith(".one.google.com"):
-        return True
+    # one.google.com is excluded — see docstring above.
     return host in {"myaccount.google.com", "mail.google.com"}
 
 
@@ -227,6 +242,7 @@ async def _wait_for_google_login_state(
         "SUCCESS",
         "WRONG_PASSWORD",
         "ACCOUNT_LOCKED",
+        "UNSAFE_BROWSER",
         "CAPTCHA",
         "UNUSUAL_ACTIVITY",
     }

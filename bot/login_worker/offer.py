@@ -15,25 +15,141 @@ from .page import _check_markers, _mask_email, _page_text, _redact_sensitive, _s
 
 logger = logging.getLogger(__name__)
 
+OFFER_CLAIMED = "CLAIMED"
+OFFER_ALREADY_ACTIVE = "ALREADY_ACTIVE"
+OFFER_NOT_ELIGIBLE = "NOT_ELIGIBLE"
+OFFER_NOT_FOUND = "NOT_FOUND"
+OFFER_PAYMENT_REQUIRED = "PAYMENT_REQUIRED"
+OFFER_MANUAL_REQUIRED = "MANUAL_REQUIRED"
+OFFER_CLAIM_FAILED = "CLAIM_FAILED"
+OFFER_CLAIMABLE = "CLAIMABLE"
+OFFER_UNKNOWN = "UNKNOWN"
 
-def _looks_like_offer_page(text: str, url: str) -> bool:
-    lowered_url = url.lower()
-    return (
-        "offer" in lowered_url
-        or "redeem" in lowered_url
-        or "claim" in lowered_url
-        or "gemini" in lowered_url
-        or "google ai" in text
-        or "ai premium" in text
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+async def _goto_one(page: Any, path: str = "/") -> None:
+    """Navigate to a Google One path and wait for the SPA to settle.
+
+    Google One is a React/Angular SPA — it NEVER fires 'networkidle'.
+    We use domcontentloaded + a fixed settle time instead.
+    """
+    url = f"https://one.google.com{path}"
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+    except Exception:
+        # Timeout on domcontentloaded is common with slow proxies; the page
+        # content is usually there anyway.
+        pass
+    # Let Angular/React finish rendering its first paint.
+    await page.wait_for_timeout(3500)
+
+
+async def _page_body(page: Any) -> str:
+    """Lowercase body text for marker matching."""
+    try:
+        return (await page.inner_text("body")).lower()
+    except Exception:
+        return ""
+
+
+async def _locator_any_visible(page: Any, selector: str, timeout: int = 500) -> bool:
+    """Return True if any matching element is visible.
+
+    Google pages often keep hidden duplicate nav buttons in the DOM. Checking
+    only `.first` can miss the visible header button.
+    """
+    try:
+        loc = page.locator(selector)
+        try:
+            count = min(await loc.count(), 10)
+            candidates = [loc.nth(i) for i in range(count)]
+        except Exception:
+            candidates = [loc.first]
+
+        for el in candidates:
+            try:
+                if await el.is_visible(timeout=timeout):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+async def _google_one_signin_visible(page: Any) -> bool:
+    selectors = [
+        "a:has-text('Sign in')",
+        "button:has-text('Sign in')",
+        "[role='button']:has-text('Sign in')",
+        "[aria-label*='Sign in' i]",
+    ]
+    for selector in selectors:
+        if await _locator_any_visible(page, selector, timeout=500):
+            return True
+    return False
+
+
+def _is_google_one_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = parsed.netloc.lower()
+    return host == "one.google.com" or host.endswith(".one.google.com")
+
+
+def _looks_like_anonymous_google_one_page(text: str, url: str) -> bool:
+    """Detect the public Google One shell/pricing page.
+
+    This page contains generic "Get started" and Google AI plan text, so it can
+    otherwise look claimable even though the account is not signed in.
+    """
+    if not _is_google_one_url(url):
+        return False
+    if "sign in" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "choose the google one plan",
+            "all google accounts come with up to 15 gb",
+            "15 gb of storage",
+            "this site uses cookies from google",
+        )
     )
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  OFFER CLAIM FLOW
-# ═══════════════════════════════════════════════════════════════════
+async def _google_one_authenticated_page(page: Any) -> bool:
+    if not _is_google_one_url(page.url):
+        return False
+    if await _google_one_signin_visible(page):
+        return False
+    body = await _page_body(page)
+    return not _looks_like_anonymous_google_one_page(body, page.url)
 
-# Text markers that indicate the offer is ALREADY active.
-# Must be specific enough NOT to match offer landing/promo pages.
+
+async def _ensure_google_one_authenticated(page: Any, job_id: str) -> bool:
+    """Return True only when Google One no longer shows the anonymous Sign in CTA."""
+    if await _google_one_authenticated_page(page):
+        return True
+
+    await _screenshot(page, job_id, "08_google_one_signin_required")
+    clicked = await _click_offer_button(page, ["sign in"], timeout=5000)
+    if not clicked:
+        return False
+
+    await _wait_for_navigation(page, timeout=10_000)
+    for _ in range(10):
+        if await _google_one_authenticated_page(page):
+            return True
+        await page.wait_for_timeout(1000)
+    return False
+
+
+# ── marker lists ─────────────────────────────────────────────────────────────
+
 _ALREADY_ACTIVE_MARKERS = [
     "you're subscribed",
     "you are subscribed",
@@ -44,9 +160,10 @@ _ALREADY_ACTIVE_MARKERS = [
     "manage subscription",
     "cancel subscription",
     "cancel plan",
+    "current plan",
+    "your plan is active",
 ]
 
-# Text / button labels that indicate a claimable offer.
 _OFFER_BUTTON_MARKERS = [
     "start trial",
     "start free trial",
@@ -61,7 +178,16 @@ _OFFER_BUTTON_MARKERS = [
     "try gemini advanced",
     "try gemini",
     "get gemini advanced",
+    "get started",
 ]
+
+_GENERIC_OFFER_BUTTON_MARKERS = [
+    "get started",
+    "subscribe",
+    "continue",
+    "next",
+]
+
 _OFFER_FOLLOWUP_BUTTON_MARKERS = [
     "accept and continue",
     "i agree",
@@ -69,6 +195,7 @@ _OFFER_FOLLOWUP_BUTTON_MARKERS = [
     "confirm",
     "confirm purchase",
     "subscribe",
+    "next",
 ]
 
 _PIXEL_OFFER_MARKERS = [
@@ -78,34 +205,149 @@ _PIXEL_OFFER_MARKERS = [
     "google ai pro",
     "gemini advanced",
     "google one ai premium",
+    "ai premium",
 ]
 
 _NOT_ELIGIBLE_MARKERS = [
     "not eligible",
     "isn't eligible",
     "not available",
-    "offer isn't there",
     "offer has expired",
     "already redeemed",
     "can't redeem",
     "cannot redeem",
 ]
 
+_SUCCESS_MARKERS = [
+    "you're all set",
+    "you are all set",
+    "welcome to",
+    "successfully",
+    "subscription started",
+    "enjoy your",
+    "trial activated",
+    "plan confirmed",
+    "your trial",
+    "activated",
+    "congratulations",
+]
+
+_STRONG_SUCCESS_CONTEXT_MARKERS = [
+    "google ai pro",
+    "gemini advanced",
+    "google one ai premium",
+    "ai premium",
+    "2 tb",
+    "2tb",
+    "google one",
+]
+
+# Google One offer/redeem URL candidates — ordered best-first.
+# Both /u/0/ (account-indexed) and non-indexed variants are tried.
+_OFFER_URLS = [
+    "https://one.google.com/u/0/offers/redeem/pixel",
+    "https://one.google.com/offers/redeem/pixel",
+    "https://one.google.com/u/0/offers",
+    "https://one.google.com/offers",
+    "https://one.google.com/u/0/about/plans?hl=en",
+    "https://one.google.com/about/plans?hl=en",
+    "https://one.google.com/u/0/intl/en/about/plans",
+    "https://one.google.com/intl/en/about/plans",
+]
+
+
+# ── offer page detection ──────────────────────────────────────────────────────
+
+def _looks_like_offer_page(text: str, url: str) -> bool:
+    lowered_url = url.lower()
+    return (
+        "offer" in lowered_url
+        or "redeem" in lowered_url
+        or "claim" in lowered_url
+        or "gemini" in lowered_url
+        or "google ai" in text
+        or "ai premium" in text
+        or "gemini advanced" in text
+    )
+
+
+def _has_offer_url_evidence(url: str) -> bool:
+    lowered_url = url.lower()
+    return any(token in lowered_url for token in ("offer", "redeem", "claim", "pixel", "gemini", "ai-premium"))
+
+
+def _is_redeem_link_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = parsed.netloc.lower()
+    target = f"{parsed.path.lower()}?{parsed.query.lower()}"
+    if host != "one.google.com" and not host.endswith(".one.google.com"):
+        return False
+    if "/about/" in target or "/plans" in target or "/storage" in target or "/settings" in target:
+        return False
+    return any(token in target for token in ("offer", "offers", "redeem", "claim", "promo", "promotion"))
+
+
+def _has_offer_context(text: str, url: str) -> bool:
+    return _has_offer_url_evidence(url) or _check_markers(text, _PIXEL_OFFER_MARKERS)
+
+
+def _has_non_generic_offer_button(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in _OFFER_BUTTON_MARKERS
+        if marker not in _GENERIC_OFFER_BUTTON_MARKERS
+    )
+
 
 def _has_claimable_pixel_offer(text: str, url: str) -> bool:
-    """Avoid treating generic Google One settings/plans pages as Pixel offers."""
+    """True only when the page has a real claimable offer button."""
+    if _looks_like_anonymous_google_one_page(text, url):
+        return False
     if _check_markers(text, _NOT_ELIGIBLE_MARKERS):
         return False
-    if not _check_markers(text, _OFFER_BUTTON_MARKERS):
+    if not _has_non_generic_offer_button(text) and not (
+        _has_offer_context(text, url) and _check_markers(text, _GENERIC_OFFER_BUTTON_MARKERS)
+    ):
         return False
-    url_lower = url.lower()
-    if any(token in url_lower for token in ("offer", "redeem", "claim", "pixel")):
-        return True
-    return _check_markers(text, _PIXEL_OFFER_MARKERS)
+    return _has_offer_context(text, url)
 
+
+def _has_strict_claim_success(text: str, url: str) -> bool:
+    if _check_markers(text, _ALREADY_ACTIVE_MARKERS):
+        return True
+    if not _check_markers(text, _SUCCESS_MARKERS):
+        return False
+    return _has_offer_url_evidence(url) or _check_markers(text, _STRONG_SUCCESS_CONTEXT_MARKERS)
+
+
+def _classify_offer_state(text: str, url: str) -> tuple[str, str]:
+    """Classify a Google One page into a claim-flow state and reason."""
+    text = text.lower()
+    if _looks_like_anonymous_google_one_page(text, url):
+        return OFFER_MANUAL_REQUIRED, "google_one_signin_required"
+    if _check_markers(text, _ALREADY_ACTIVE_MARKERS):
+        return OFFER_ALREADY_ACTIVE, "active_subscription_marker"
+    if _check_markers(text, _PAYMENT_REQUIRED_MARKERS):
+        return OFFER_PAYMENT_REQUIRED, "payment_method_required"
+    if _check_markers(text, _NOT_ELIGIBLE_MARKERS):
+        return OFFER_NOT_ELIGIBLE, "not_eligible_or_redeemed"
+    if _has_strict_claim_success(text, url):
+        return OFFER_CLAIMED, "strict_success_marker"
+    if _has_claimable_pixel_offer(text, url):
+        return OFFER_CLAIMABLE, "claimable_offer_detected"
+    return OFFER_UNKNOWN, "no_offer_state_detected"
+
+
+# ── offer link extraction ─────────────────────────────────────────────────────
 
 def _score_offer_url(url: str) -> int:
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return 0
     host = parsed.netloc.lower()
     target = f"{parsed.path.lower()}?{parsed.query.lower()}"
     score = 0
@@ -123,22 +365,29 @@ def _score_offer_url(url: str) -> int:
             score += 10
         else:
             score -= 10
-    if any(token in target for token in ("redeem", "claim", "promo", "promotion")):
+    if any(t in target for t in ("redeem", "claim", "promo", "promotion")):
         score += 25
-    if any(token in target for token in ("gemini", "ai-premium", "google-ai", "pixel")):
+    if any(t in target for t in ("gemini", "ai-premium", "google-ai", "pixel")):
         score += 20
-    if any(token in target for token in ("checkout", "subscribe", "subscription", "purchase")):
+    if any(t in target for t in ("checkout", "subscribe", "subscription", "purchase")):
         score += 10
     if target.rstrip("?") in ("", "/", "/settings", "/about/plans", "/plans", "/storage"):
         score -= 30
-    if any(token in target for token in ("/plans", "/storage", "g1_last_touchpoint")):
+    if any(t in target for t in ("/plans", "/storage", "g1_last_touchpoint")):
         score -= 35
 
     return score
 
 
 async def _extract_offer_link(page: Any, *preferred_urls: str) -> str:
-    """Return the best Google One offer/redeem URL visible on the page."""
+    """Return the best Google One offer/redeem URL visible on the page.
+
+    Collects links from:
+      1. href attributes on <a> tags
+      2. data-url / data-href attributes (Google uses these on SPAs)
+      3. onclick / data-action strings that look like URLs
+      4. Preferred URLs passed by caller
+    """
     candidates: set[str] = set()
     base_url = page.url
 
@@ -147,23 +396,40 @@ async def _extract_offer_link(page: Any, *preferred_urls: str) -> str:
             candidates.add(urljoin(base_url, url))
 
     try:
-        hrefs = await page.eval_on_selector_all(
-            "a[href]",
-            "els => els.map(e => e.getAttribute('href')).filter(Boolean)",
-        )
+        # Collect all link-like attributes in one JS call
+        raw_links = await page.evaluate(r"""() => {
+            const links = new Set();
+            // <a href>
+            document.querySelectorAll('a[href]').forEach(el => {
+                const h = el.getAttribute('href');
+                if (h) links.add(h);
+            });
+            // data-url, data-href, data-action
+            document.querySelectorAll('[data-url],[data-href],[data-action]').forEach(el => {
+                ['data-url','data-href','data-action'].forEach(attr => {
+                    const v = el.getAttribute(attr);
+                    if (v && (v.startsWith('/') || v.startsWith('http'))) links.add(v);
+                });
+            });
+            // onclick="location.href='...'" or similar
+            document.querySelectorAll('[onclick]').forEach(el => {
+                const m = (el.getAttribute('onclick') || '').match(/['\"](\/[^'\"]+|https?:[^'\"]+)['\"]/)
+                if (m) links.add(m[1]);
+            });
+            return [...links];
+        }""")
+        for href in (raw_links or []):
+            if not isinstance(href, str):
+                continue
+            href = href.strip()
+            if not href or href.startswith(("javascript:", "mailto:", "tel:")):
+                continue
+            candidates.add(urljoin(base_url, href))
     except Exception:
-        hrefs = []
-
-    for href in hrefs:
-        if not isinstance(href, str):
-            continue
-        href = href.strip()
-        if not href or href.startswith(("javascript:", "mailto:", "tel:")):
-            continue
-        candidates.add(urljoin(base_url, href))
+        pass
 
     ranked = sorted(
-        ((_score_offer_url(url), url) for url in candidates),
+        ((_score_offer_url(url), url) for url in candidates if _is_redeem_link_url(url)),
         key=lambda item: item[0],
         reverse=True,
     )
@@ -171,6 +437,90 @@ async def _extract_offer_link(page: Any, *preferred_urls: str) -> str:
         return ranked[0][1]
     return ""
 
+
+# ── button clicking ───────────────────────────────────────────────────────────
+
+async def _click_offer_button(page: Any, labels: list[str], timeout: int = 5000) -> str | None:
+    """Click the first visible button whose text matches any label.
+
+    Handles:
+      • Standard HTML buttons / anchors
+      • Google Material Web Components (mwc-button, material-button)
+      • Shadow DOM elements (via JS pierce)
+      • Elements with aria-label instead of visible text
+
+    Returns the label that was clicked, or None.
+    """
+    # 1. Playwright locator approach (fastest)
+    for label in labels:
+        safe_label = label.replace("'", "\\'")
+        selectors = [
+            f"button:has-text('{safe_label}')",
+            f"a:has-text('{safe_label}')",
+            f"[role='button']:has-text('{safe_label}')",
+            f"mwc-button:has-text('{safe_label}')",
+            f"material-button:has-text('{safe_label}')",
+            f"[jsname]:has-text('{safe_label}')",
+            f"[aria-label*='{safe_label}' i]",
+        ]
+        combined = ", ".join(selectors)
+        try:
+            loc = page.locator(combined).first
+            if await loc.is_visible(timeout=timeout):
+                await loc.click(timeout=timeout)
+                return label
+        except Exception:
+            pass
+
+    # 2. JS fallback — pierces Shadow DOM and handles Web Components
+    try:
+        clicked_label = await page.evaluate("""(labels) => {
+            function findAndClick(root) {
+                for (const label of labels) {
+                    const lower = label.toLowerCase();
+                    const candidates = root.querySelectorAll(
+                        'button, a, [role="button"], mwc-button, ' +
+                        'material-button, [jsname], [tabindex="0"]'
+                    );
+                    for (const el of candidates) {
+                        const txt = (
+                            el.innerText || el.textContent ||
+                            el.getAttribute('aria-label') || ''
+                        ).trim().toLowerCase();
+                        const style = window.getComputedStyle(el);
+                        const hidden = (
+                            style.display === 'none' ||
+                            style.visibility === 'hidden' ||
+                            el.offsetParent === null
+                        );
+                        if (!hidden && txt.includes(lower)) {
+                            el.click();
+                            return label;
+                        }
+                    }
+                    // Check shadow roots one level deep
+                    for (const el of root.querySelectorAll('*')) {
+                        if (el.shadowRoot) {
+                            const result = findAndClick(el.shadowRoot);
+                            if (result) return result;
+                        }
+                    }
+                }
+                return null;
+            }
+            return findAndClick(document);
+        }""", labels)
+        if clicked_label:
+            return clicked_label
+    except Exception:
+        pass
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN CLAIM FUNCTION
+# ═══════════════════════════════════════════════════════════════════
 
 async def _claim_pixel_offer(
     page: Any,
@@ -189,6 +539,7 @@ async def _claim_pixel_offer(
       "CLAIM_FAILED"     – found offer but couldn't complete claim
     """
     masked_email = _mask_email(gmail)
+
     try:
         await _notify(
             bot, chat_id,
@@ -197,16 +548,42 @@ async def _claim_pixel_offer(
             "Opening Google One and checking Pixel/Gemini eligibility.",
         )
 
-        # ── Go to Google One home ──────────────────────────────────
-        await page.goto("https://one.google.com/", wait_until="networkidle")
-        await page.wait_for_timeout(3000)
+        # ── Step 1: Go to Google One home ─────────────────────────────
+        await _goto_one(page, "/")
         await _screenshot(page, job_id, "08_one_home")
+        if not await _ensure_google_one_authenticated(page, job_id):
+            ss = await _screenshot(page, job_id, "08_google_one_still_anonymous")
+            await _update_job_status(
+                telegram_id, job_id, "PROCESSING",
+                {
+                    "offer_result": OFFER_MANUAL_REQUIRED,
+                    "offer_reason": "google_one_signin_required",
+                    "claim_result_url": page.url,
+                    "progress_note": "Google One sign-in required",
+                },
+            )
+            await _notify(
+                bot,
+                chat_id,
+                f"âš ï¸ <b>Job {html_esc(job_id)}</b>\n\n"
+                "<b>Google One sign-in required</b>\n"
+                "Google One still shows the Sign in button, so offer scanning was stopped.",
+            )
+            if ss:
+                await _notify_photo(bot, chat_id, ss, "Google One sign-in required")
+            return OFFER_MANUAL_REQUIRED
 
-        body = await _page_text(page)
+        await _screenshot(page, job_id, "08_one_authenticated")
+        body = await _page_body(page)
+        state, reason = _classify_offer_state(body, page.url)
 
-        # Check if already subscribed
-        if any(m in body for m in _ALREADY_ACTIVE_MARKERS):
+        # Already subscribed?
+        if state == OFFER_ALREADY_ACTIVE:
             ss = await _screenshot(page, job_id, "08_already_active")
+            await _update_job_status(
+                telegram_id, job_id, "PROCESSING",
+                {"offer_result": state, "offer_reason": reason, "claim_result_url": page.url},
+            )
             await _notify(
                 bot, chat_id,
                 f"ℹ️ <b>Job {html_esc(job_id)}</b>\n\n"
@@ -215,86 +592,159 @@ async def _claim_pixel_offer(
             )
             if ss:
                 await _notify_photo(bot, chat_id, ss, "Already subscribed")
-            return "ALREADY_ACTIVE"
+            return OFFER_ALREADY_ACTIVE
 
-        # ── Strategy 1: check Settings → Offers ────────────────────
+        # ── Step 2: Try Settings → Offers ─────────────────────────────
         offer_found = False
         offer_page_url = ""
         initial_offer_link = ""
+        not_eligible_url = ""
+        not_eligible_reason = ""
+        signin_required_url = ""
+        signin_required_reason = ""
 
         try:
-            await page.goto(
-                "https://one.google.com/settings", wait_until="networkidle"
-            )
-            await page.wait_for_timeout(2000)
+            await _goto_one(page, "/settings")
             await _screenshot(page, job_id, "09_settings")
-
-            # Look for "Check for offers" or similar
-            for label in ["Check for offers", "Offers", "Promotions"]:
+            for label in ["Check for offers", "Offers", "Promotions", "Redeem"]:
                 try:
                     btn = page.locator(f"text={label}").first
                     if await btn.is_visible(timeout=3000):
                         await btn.click()
                         await _wait_for_navigation(page)
                         await page.wait_for_timeout(3000)
-                        body = await _page_text(page)
-                        if _has_claimable_pixel_offer(body, page.url):
+                        body = await _page_body(page)
+                        state, reason = _classify_offer_state(body, page.url)
+                        if state == OFFER_MANUAL_REQUIRED and reason == "google_one_signin_required":
+                            signin_required_url = page.url
+                            signin_required_reason = reason
+                            break
+                        if state == OFFER_NOT_ELIGIBLE:
+                            not_eligible_url = page.url
+                            not_eligible_reason = reason
+                        if state == OFFER_CLAIMABLE:
                             offer_found = True
                             offer_page_url = page.url
+                            logger.info("[%s] Offer found via Settings at: %s", job_id, page.url)
                             break
                 except Exception:
                     continue
         except Exception:
             pass
 
-        # ── Strategy 2: direct offer redemption URLs ───────────────
-        if not offer_found:
-            offer_urls = [
-                # Pixel device offer direct redeem
-                "https://one.google.com/u/0/offers/redeem/pixel",
-                # Generic offers page
-                "https://one.google.com/offers",
-                # Gemini Advanced plans page
-                "https://one.google.com/intl/en/about/plans",
-                # Older path still sometimes works
-                "https://one.google.com/about/plans",
-            ]
-            for url in offer_urls:
+        # ── Step 3: Try direct offer URLs ──────────────────────────────
+        if not offer_found and not signin_required_url:
+            for url in _OFFER_URLS:
                 try:
-                    await page.goto(url, wait_until="networkidle")
-                    await page.wait_for_timeout(3000)
-                    body = await _page_text(page)
-                    # Check for offer buttons but NOT already-active markers
-                    already = any(m in body for m in _ALREADY_ACTIVE_MARKERS)
-                    has_offer = _has_claimable_pixel_offer(body, page.url)
-                    if has_offer and not already:
-                        offer_found = True
-                        offer_page_url = page.url
-                        logger.info("[%s] Offer found at: %s", job_id, page.url)
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(3500)
+
+                    body = await _page_body(page)
+                    state, reason = _classify_offer_state(body, page.url)
+
+                    if state == OFFER_MANUAL_REQUIRED and reason == "google_one_signin_required":
+                        signin_required_url = page.url
+                        signin_required_reason = reason
                         break
-                    elif already:
-                        logger.info("[%s] Already subscribed detected at %s", job_id, url)
+
+                    if state == OFFER_ALREADY_ACTIVE:
+                        logger.info("[%s] Already subscribed at %s", job_id, url)
+                        await _update_job_status(
+                            telegram_id, job_id, "PROCESSING",
+                            {"offer_result": state, "offer_reason": reason, "claim_result_url": page.url},
+                        )
                         await _notify(
                             bot, chat_id,
                             f"ℹ️ <b>Job {html_esc(job_id)}</b>\n\n"
                             "<b>Plan already active</b>\n"
                             f"Account: <code>{html_esc(masked_email)}</code>",
                         )
-                        return "ALREADY_ACTIVE"
+                        return OFFER_ALREADY_ACTIVE
+
+                    if state == OFFER_NOT_ELIGIBLE:
+                        not_eligible_url = page.url
+                        not_eligible_reason = reason
+                        break
+
+                    if state == OFFER_CLAIMABLE:
+                        offer_found = True
+                        offer_page_url = page.url
+                        logger.info("[%s] Offer found at: %s", job_id, page.url)
+                        break
                 except Exception:
                     continue
 
         await _screenshot(page, job_id, "10_offer_page")
 
+        # Last-resort: check wherever we landed
         if not offer_found:
-            # Last check — maybe the page has offer buttons anyway
-            body = await _page_text(page)
-            if _has_claimable_pixel_offer(body, page.url):
+            body = await _page_body(page)
+            state, reason = _classify_offer_state(body, page.url)
+            if state == OFFER_MANUAL_REQUIRED and reason == "google_one_signin_required":
+                signin_required_url = page.url
+                signin_required_reason = reason
+            if state == OFFER_NOT_ELIGIBLE:
+                not_eligible_url = page.url
+                not_eligible_reason = reason
+            if state == OFFER_CLAIMABLE:
                 offer_found = True
                 offer_page_url = page.url
 
         if not offer_found:
+            if signin_required_url:
+                ss = await _screenshot(page, job_id, "10_google_one_signin_required")
+                await _update_job_status(
+                    telegram_id, job_id, "PROCESSING",
+                    {
+                        "offer_result": OFFER_MANUAL_REQUIRED,
+                        "offer_reason": signin_required_reason or "google_one_signin_required",
+                        "claim_result_url": signin_required_url,
+                        "progress_note": "Google One sign-in required",
+                    },
+                )
+                await _notify(
+                    bot,
+                    chat_id,
+                    f"Ã¢Å¡Â Ã¯Â¸Â <b>Job {html_esc(job_id)}</b>\n\n"
+                    "<b>Google One sign-in required</b>\n"
+                    "Google One opened the public plans page instead of the signed-in offer page.",
+                )
+                if ss:
+                    await _notify_photo(bot, chat_id, ss, "Google One sign-in required")
+                return OFFER_MANUAL_REQUIRED
+
+            if not_eligible_url:
+                ss = await _screenshot(page, job_id, "10_not_eligible")
+                await _update_job_status(
+                    telegram_id, job_id, "PROCESSING",
+                    {
+                        "offer_result": OFFER_NOT_ELIGIBLE,
+                        "offer_reason": not_eligible_reason or "not_eligible_or_redeemed",
+                        "claim_result_url": not_eligible_url,
+                    },
+                )
+                await _notify(
+                    bot, chat_id,
+                    f"âš ï¸ <b>Job {html_esc(job_id)}</b>\n\n"
+                    "<b>Offer not eligible</b>\n"
+                    "Google says this account cannot redeem the Pixel/Gemini offer.",
+                )
+                if ss:
+                    await _notify_photo(bot, chat_id, ss, "Offer not eligible")
+                return OFFER_NOT_ELIGIBLE
+
             ss = await _screenshot(page, job_id, "10_no_offer")
+            await _update_job_status(
+                telegram_id, job_id, "PROCESSING",
+                {
+                    "offer_result": OFFER_NOT_FOUND,
+                    "offer_reason": "no_claimable_offer_detected",
+                    "claim_result_url": page.url,
+                },
+            )
             await _notify(
                 bot, chat_id,
                 f"⚠️ <b>Job {html_esc(job_id)}</b>\n\n"
@@ -303,117 +753,71 @@ async def _claim_pixel_offer(
             )
             if ss:
                 await _notify_photo(bot, chat_id, ss, "No offer found")
-            return "NOT_FOUND"
+            return OFFER_NOT_FOUND
 
+        # ── Step 4: Extract offer link and store it ────────────────────
         offer_page_url = offer_page_url or page.url
         initial_offer_link = await _extract_offer_link(page, offer_page_url)
-        status_extra = {"offer_page_url": offer_page_url}
+        status_extra: dict[str, str] = {
+            "offer_result": OFFER_CLAIMABLE,
+            "offer_reason": "claimable_offer_detected",
+            "offer_page_url": offer_page_url,
+        }
         if initial_offer_link:
             status_extra["redeem_link"] = initial_offer_link
         await _update_job_status(telegram_id, job_id, "PROCESSING", status_extra)
 
-        # ── Click through the claim flow ───────────────────────────
         await _notify(
             bot, chat_id,
             f"🎁 <b>Job {html_esc(job_id)}</b>\n\n"
-            "<b>Offer found</b>\n"
-            "Starting the claim flow.",
+            "<b>Offer found!</b>\n"
+            "Starting the claim flow."
+            + (f"\n\n🔗 Offer link: {initial_offer_link}" if initial_offer_link else ""),
         )
 
-        # Try explicit offer buttons first; only use generic continuation on
-        # offer-specific pages to avoid walking unrelated Google One flows.
-        claimed = False
-        for attempt_btn in range(5):  # up to 5 screens of buttons
-            body = await _page_text(page)
-            clicked = False
+        # ── Step 5: Click through claim flow ──────────────────────────
+        terminal_state = ""
+        terminal_reason = ""
+        clicked_labels: list[str] = []
 
+        for step in range(6):   # up to 6 button screens
+            body = await _page_body(page)
+
+            # Build button label list for this step
             labels = list(_OFFER_BUTTON_MARKERS)
             if _looks_like_offer_page(body, page.url):
                 labels.extend(_OFFER_FOLLOWUP_BUTTON_MARKERS)
 
-            for label in labels:
-                try:
-                    # Broad selector covering standard + Google Material/Web components
-                    btns = page.locator(
-                        f"button:has-text('{label}'), "
-                        f"a:has-text('{label}'), "
-                        f"[role='button']:has-text('{label}'), "
-                        f"mwc-button:has-text('{label}'), "
-                        f"material-button:has-text('{label}'), "
-                        f"[jsname]:has-text('{label}')"
-                    )
-                    count = await btns.count()
-                    if count > 0:
-                        btn = btns.first
-                        if await btn.is_visible(timeout=3000):
-                            logger.info(
-                                "[%s] Clicking offer button: '%s'",
-                                job_id, label,
-                            )
-                            await btn.click()
-                            await _wait_for_navigation(page)
-                            await page.wait_for_timeout(3000)
-                            await _screenshot(
-                                page, job_id,
-                                f"11_claim_step_{attempt_btn}",
-                            )
-                            clicked = True
-                            break
-                except Exception:
-                    continue
-
-            # Also try JS-click as fallback for shadow DOM / hidden buttons
-            if not clicked:
-                try:
-                    js_clicked = await page.evaluate('''
-                        (labels) => {
-                            for (const label of labels) {
-                                const lower = label.toLowerCase();
-                                for (const el of document.querySelectorAll(
-                                    'button, a, [role="button"], mwc-button'
-                                )) {
-                                    const txt = (el.innerText || el.textContent || "").trim().toLowerCase();
-                                    if (txt.includes(lower) && el.offsetParent !== null) {
-                                        el.click();
-                                        return label;
-                                    }
-                                }
-                            }
-                            return null;
-                        }
-                    ''', labels)
-                    if js_clicked:
-                        logger.info("[%s] JS-clicked offer button: '%s'", job_id, js_clicked)
-                        await _wait_for_navigation(page)
-                        await page.wait_for_timeout(3000)
-                        clicked = True
-                except Exception:
-                    pass
-
-            if not clicked:
+            clicked_label = await _click_offer_button(page, labels, timeout=4000)
+            if clicked_label:
+                clicked_labels.append(clicked_label)
+                logger.info("[%s] step=%d clicked '%s'", job_id, step, clicked_label)
+                await _wait_for_navigation(page)
+                await page.wait_for_timeout(3000)
+                await _screenshot(page, job_id, f"11_claim_step_{step}")
+            else:
+                # No clickable button found — we're done or stuck
+                logger.info("[%s] step=%d no button found, stopping", job_id, step)
                 break
 
-            # Check if we reached a confirmation / success state
-            body = await _page_text(page)
-            success_markers = [
-                "you're all set",
-                "welcome to",
-                "successfully",
-                "subscription started",
-                "your plan",
-                "enjoy your",
-                "trial activated",
-                "plan confirmed",
-            ]
-            if any(m in body for m in success_markers):
-                claimed = True
+            # Check success after each click
+            body = await _page_body(page)
+            state, reason = _classify_offer_state(body, page.url)
+            if state in {OFFER_CLAIMED, OFFER_ALREADY_ACTIVE, OFFER_NOT_ELIGIBLE}:
+                terminal_state = state
+                terminal_reason = reason
                 break
-            if _check_markers(body, _PAYMENT_REQUIRED_MARKERS):
+            if state == OFFER_PAYMENT_REQUIRED:
+                terminal_state = state
+                terminal_reason = reason
                 await _update_job_status(
                     telegram_id, job_id, "PROCESSING",
                     {
+                        "offer_result": state,
+                        "offer_reason": reason,
                         "claim_result_url": page.url,
                         "offer_page_url": offer_page_url,
+                        "clicked_offer_buttons": ", ".join(clicked_labels),
                         "progress_note": "Payment method required",
                     },
                 )
@@ -421,70 +825,64 @@ async def _claim_pixel_offer(
 
         ss = await _screenshot(page, job_id, "12_claim_result")
 
-        if claimed:
-            redeem_link = await _extract_offer_link(
-                page, page.url, offer_page_url, initial_offer_link,
-            )
-            claim_extra = {
-                "claim_result_url": page.url,
-                "offer_page_url": offer_page_url,
-            }
-            if redeem_link:
-                claim_extra["redeem_link"] = redeem_link
-            await _update_job_status(telegram_id, job_id, "PROCESSING", claim_extra)
+        # ── Step 6: Evaluate final state ───────────────────────────────
+        body = await _page_body(page)
+        redeem_link = await _extract_offer_link(
+            page, page.url, offer_page_url, initial_offer_link,
+        )
+        claim_extra: dict[str, str] = {
+            "claim_result_url": page.url,
+            "offer_page_url": offer_page_url,
+        }
+        if redeem_link:
+            claim_extra["redeem_link"] = redeem_link
+        if clicked_labels:
+            claim_extra["clicked_offer_buttons"] = ", ".join(clicked_labels)
 
+        final_state, final_reason = _classify_offer_state(body, page.url)
+        if terminal_state:
+            final_state, final_reason = terminal_state, terminal_reason
+        claim_extra["offer_result"] = final_state
+        claim_extra["offer_reason"] = final_reason
+
+        if final_state in {OFFER_CLAIMED, OFFER_ALREADY_ACTIVE}:
+            await _update_job_status(telegram_id, job_id, "PROCESSING", claim_extra)
             await _notify(
                 bot, chat_id,
                 f"🎉 <b>Job {html_esc(job_id)}</b>\n\n"
-                "<b>Offer claimed successfully</b>\n"
+                "<b>Offer claimed successfully!</b>\n"
                 f"Account: <code>{html_esc(masked_email)}</code>\n"
                 "Google One AI Premium / Gemini Advanced activated."
                 + (f"\n\n🔗 Redeem link: {redeem_link}" if redeem_link else ""),
             )
             if ss:
                 await _notify_photo(bot, chat_id, ss, "🎉 Offer claimed!")
-            return "CLAIMED"
+            return OFFER_CLAIMED if final_state == OFFER_CLAIMED else OFFER_ALREADY_ACTIVE
 
-        # Check once more — subscription may have activated silently
-        body = await _page_text(page)
-        if any(m in body for m in _ALREADY_ACTIVE_MARKERS):
-            redeem_link = await _extract_offer_link(
-                page, page.url, offer_page_url, initial_offer_link,
-            )
-            claim_extra = {
-                "claim_result_url": page.url,
-                "offer_page_url": offer_page_url,
-            }
-            if redeem_link:
-                claim_extra["redeem_link"] = redeem_link
+        if final_state == OFFER_NOT_ELIGIBLE:
+            claim_extra["progress_note"] = "Offer not eligible"
             await _update_job_status(telegram_id, job_id, "PROCESSING", claim_extra)
             await _notify(
                 bot, chat_id,
-                f"🎉 <b>Job {html_esc(job_id)}</b>\n\n"
-                "<b>Plan active</b>\n"
-                f"Account: <code>{html_esc(masked_email)}</code>"
-                + (f"\n\n🔗 Redeem link: {redeem_link}" if redeem_link else ""),
+                f"âš ï¸ <b>Job {html_esc(job_id)}</b>\n\n"
+                "<b>Offer not eligible</b>\n"
+                "Google says this account cannot redeem the Pixel/Gemini offer."
+                + (f"\n\nðŸ”— Offer link: {redeem_link}" if redeem_link else ""),
             )
             if ss:
-                await _notify_photo(bot, chat_id, ss, "Plan active")
-            return "CLAIMED"
+                await _notify_photo(bot, chat_id, ss, "Offer not eligible")
+            return OFFER_NOT_ELIGIBLE
 
-        # We found the offer but couldn't fully complete
-        redeem_link = await _extract_offer_link(
-            page, page.url, offer_page_url, initial_offer_link,
+        # Offer found but couldn't fully complete
+        needs_payment = final_state == OFFER_PAYMENT_REQUIRED
+        result = OFFER_PAYMENT_REQUIRED if needs_payment else OFFER_MANUAL_REQUIRED
+        claim_extra["offer_result"] = result
+        claim_extra["progress_note"] = (
+            "Payment method required" if needs_payment
+            else "Claim requires manual completion"
         )
-        body = await _page_text(page)
-        needs_payment = _check_markers(body, _PAYMENT_REQUIRED_MARKERS)
-        claim_extra = {
-            "claim_result_url": page.url,
-            "offer_page_url": offer_page_url,
-            "progress_note": (
-                "Payment method required" if needs_payment else "Claim requires manual completion"
-            ),
-        }
-        if redeem_link:
-            claim_extra["redeem_link"] = redeem_link
         await _update_job_status(telegram_id, job_id, "PROCESSING", claim_extra)
+
         message = (
             "Offer checkout requires a valid payment method and final Subscribe tap."
             if needs_payment
@@ -498,11 +896,8 @@ async def _claim_pixel_offer(
             + (f"\n\n🔗 Offer link: {redeem_link}" if redeem_link else ""),
         )
         if ss:
-            await _notify_photo(
-                bot, chat_id, ss,
-                "Claim incomplete — may need payment method",
-            )
-        return "CLAIM_FAILED"
+            await _notify_photo(bot, chat_id, ss, "Payment required" if needs_payment else "Claim incomplete")
+        return result
 
     except Exception as exc:
         safe_error = _redact_sensitive(str(exc), gmail)
@@ -516,8 +911,4 @@ async def _claim_pixel_offer(
         )
         if ss:
             await _notify_photo(bot, chat_id, ss, "Claim error")
-        return "CLAIM_FAILED"
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  CORE LOGIN FLOW
+        return OFFER_CLAIM_FAILED
