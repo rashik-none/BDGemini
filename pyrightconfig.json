@@ -1,0 +1,5 @@
+{
+  "extraPaths": [
+    "./invisible_playwright/src"
+  ]
+}

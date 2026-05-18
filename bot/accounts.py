@@ -1,0 +1,474 @@
+"""Accounts / jobs persistence layer — backed by MongoDB (Motor)."""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from bot.config import ACCOUNTS_FILE
+from bot.database import mongo_available, users_col
+
+_JSON_LOCK = threading.Lock()
+
+
+# ── Default document shape ────────────────────────────────────────────
+
+def default_account() -> dict[str, Any]:
+    return {
+        "deposit_credit": 0,
+        "total_deposit": 0,
+        "deposit_spent": 0,
+        "referral_spent": 0,
+        "valid_invited_users": 0,
+        "pending_referrals": 0,
+        "status": "active",
+        "referred_by": None,
+        "jobs": [],
+    }
+
+
+def normalize_account(account: dict) -> dict:
+    defaults = default_account()
+    for key, value in defaults.items():
+        account.setdefault(key, value)
+    if not isinstance(account.get("jobs"), list):
+        account["jobs"] = []
+    return account
+
+
+# ── Low-level MongoDB helpers ─────────────────────────────────────────
+
+def _load_json_accounts() -> dict[str, dict]:
+    if not ACCOUNTS_FILE.exists():
+        return {}
+    try:
+        with ACCOUNTS_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_json_accounts(accounts: dict[str, dict]) -> None:
+    tmp = ACCOUNTS_FILE.with_name(f"{ACCOUNTS_FILE.name}.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(accounts, f, indent=2, sort_keys=True)
+    os.replace(tmp, ACCOUNTS_FILE)
+
+
+async def _find_user(telegram_id: str) -> dict | None:
+    if not mongo_available():
+        account = _load_json_accounts().get(telegram_id)
+        if account:
+            normalize_account(account)
+        return account
+
+    doc = await users_col().find_one({"_id": telegram_id})
+    if doc:
+        doc.pop("_id", None)
+        normalize_account(doc)
+    return doc
+
+
+async def _upsert_user(telegram_id: str, account: dict) -> None:
+    if not mongo_available():
+        with _JSON_LOCK:
+            accounts = _load_json_accounts()
+            accounts[telegram_id] = normalize_account(account)
+            _save_json_accounts(accounts)
+        return
+
+    payload = {k: v for k, v in account.items() if k != "_id"}
+    await users_col().update_one(
+        {"_id": telegram_id},
+        {"$set": payload},
+        upsert=True,
+    )
+
+
+# ── Public account helpers ────────────────────────────────────────────
+
+async def get_account(telegram_id: str) -> dict:
+    doc = await _find_user(telegram_id)
+    if doc is None:
+        doc = default_account()
+        await _upsert_user(telegram_id, doc)
+    return doc
+
+
+async def save_account(telegram_id: str, account: dict) -> None:
+    await _upsert_user(telegram_id, account)
+
+
+async def list_account_ids() -> list[str]:
+    if not mongo_available():
+        return sorted(_load_json_accounts().keys())
+
+    cursor = users_col().find({}, {"_id": 1})
+    ids = [doc["_id"] async for doc in cursor]
+    return sorted(ids)
+
+
+async def set_account_status(telegram_id: str, status: str) -> bool:
+    if not mongo_available():
+        with _JSON_LOCK:
+            accounts = _load_json_accounts()
+            account = accounts.get(telegram_id)
+            if not account:
+                return False
+            normalize_account(account)
+            account["status"] = status
+            accounts[telegram_id] = account
+            _save_json_accounts(accounts)
+        return True
+
+    result = await users_col().update_one(
+        {"_id": telegram_id},
+        {"$set": {"status": status}},
+    )
+    return result.matched_count > 0
+
+
+async def adjust_deposit_credit(telegram_id: str, amount: int) -> tuple[bool, int]:
+    if not mongo_available():
+        with _JSON_LOCK:
+            accounts = _load_json_accounts()
+            account = accounts.get(telegram_id)
+            if not account:
+                return False, 0
+            normalize_account(account)
+            current = int(account.get("deposit_credit", 0))
+            new_balance = max(0, current + amount)
+            account["deposit_credit"] = new_balance
+            if amount > 0:
+                account["total_deposit"] = int(account.get("total_deposit", 0)) + amount
+            accounts[telegram_id] = account
+            _save_json_accounts(accounts)
+        return True, new_balance
+
+    doc = await _find_user(telegram_id)
+    if doc is None:
+        return False, 0
+
+    current = int(doc.get("deposit_credit", 0))
+    new_balance = max(0, current + amount)
+
+    update: dict[str, Any] = {"deposit_credit": new_balance}
+    if amount > 0:
+        update["total_deposit"] = int(doc.get("total_deposit", 0)) + amount
+
+    await users_col().update_one({"_id": telegram_id}, {"$set": update})
+    return True, new_balance
+
+
+# ── Referral helpers ──────────────────────────────────────────────────
+
+async def register_referral(current_id: str, referrer_id: str | None) -> None:
+    if not referrer_id or referrer_id == current_id:
+        return
+    if not current_id.isdigit() or not referrer_id.isdigit():
+        return
+
+    if not mongo_available():
+        with _JSON_LOCK:
+            accounts = _load_json_accounts()
+            current = normalize_account(accounts.setdefault(current_id, default_account()))
+            if current.get("referred_by"):
+                return
+            referrer = normalize_account(accounts.setdefault(referrer_id, default_account()))
+            current["referred_by"] = referrer_id
+            referrer["valid_invited_users"] = int(referrer.get("valid_invited_users", 0)) + 1
+            accounts[current_id] = current
+            accounts[referrer_id] = referrer
+            _save_json_accounts(accounts)
+        return
+
+    current = await _find_user(current_id)
+    if current is None:
+        current = default_account()
+
+    if current.get("referred_by"):
+        return  # already referred
+
+    current["referred_by"] = referrer_id
+    await _upsert_user(current_id, current)
+
+    # Atomically increment referrer's invited count
+    await users_col().update_one(
+        {"_id": referrer_id},
+        {"$inc": {"valid_invited_users": 1}},
+        upsert=True,
+    )
+
+
+# ── Credit math (pure helpers — no I/O) ──────────────────────────────
+
+def referral_earned_credit(account: dict) -> int:
+    from bot.config import REFERRAL_USERS_PER_CREDIT
+    return int(account.get("valid_invited_users", 0)) // REFERRAL_USERS_PER_CREDIT
+
+
+def referral_credit(account: dict) -> int:
+    return max(0, referral_earned_credit(account) - int(account.get("referral_spent", 0)))
+
+
+def balance_credit(account: dict) -> int:
+    return int(account.get("deposit_credit", 0)) + referral_credit(account)
+
+
+def total_spent(account: dict) -> int:
+    return int(account.get("deposit_spent", 0)) + int(account.get("referral_spent", 0))
+
+
+def remaining_for_reward(account: dict) -> int:
+    from bot.config import REFERRAL_USERS_PER_CREDIT
+    remainder = int(account.get("valid_invited_users", 0)) % REFERRAL_USERS_PER_CREDIT
+    return 0 if remainder == 0 else REFERRAL_USERS_PER_CREDIT - remainder
+
+
+def add_deposit(account: dict, amount: int) -> None:
+    account["deposit_credit"] = int(account.get("deposit_credit", 0)) + amount
+    account["total_deposit"] = int(account.get("total_deposit", 0)) + amount
+
+
+def charge_account(account: dict, price: int) -> tuple[bool, str]:
+    """Charge the account in-memory. Caller must save afterwards."""
+    if balance_credit(account) < price:
+        return False, ""
+
+    deposit_used = min(int(account.get("deposit_credit", 0)), price)
+    account["deposit_credit"] = int(account.get("deposit_credit", 0)) - deposit_used
+    account["deposit_spent"] = int(account.get("deposit_spent", 0)) + deposit_used
+
+    referral_used = price - deposit_used
+    account["referral_spent"] = int(account.get("referral_spent", 0)) + referral_used
+
+    if deposit_used > 0 and referral_used > 0:
+        source = "DEPOSIT+REFERRAL"
+    elif deposit_used > 0:
+        source = "DEPOSIT"
+    else:
+        source = "REFERRAL"
+    return True, source
+
+
+# ── Job helpers ───────────────────────────────────────────────────────
+
+def create_job(
+    account: dict,
+    gmail: str,
+    method: str,
+    charged: int = 0,
+    credit_source: str = "",
+) -> dict:
+    job: dict[str, Any] = {
+        "id": "cm" + uuid.uuid4().hex[:14],
+        "gmail": gmail,
+        "method": method,
+        "status": "PENDING",
+        "charged": charged,
+        "credit_source": credit_source,
+        "progress": 0,
+        "progress_note": "",
+        "redeem_link": "",
+        "error": "",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    account.setdefault("jobs", []).insert(0, job)
+    account["jobs"] = account["jobs"][:50]
+    return job
+
+
+def recent_jobs(account: dict, limit: int = 10) -> list[dict]:
+    jobs = account.get("jobs", [])
+    if not isinstance(jobs, list):
+        return []
+    return jobs[:limit]
+
+
+async def all_recent_jobs(limit: int = 10) -> list[tuple[str, dict]]:
+    items: list[tuple[str, dict]] = []
+    if not mongo_available():
+        for tid, account in _load_json_accounts().items():
+            normalize_account(account)
+            for job in recent_jobs(account, 50):
+                items.append((tid, job))
+    else:
+        cursor = users_col().find({})
+        async for doc in cursor:
+            tid = doc.pop("_id", "")
+            normalize_account(doc)
+            for job in recent_jobs(doc, 50):
+                items.append((tid, job))
+
+    def _sort_key(item: tuple[str, dict]) -> str:
+        return str(item[1].get("updated_at") or item[1].get("created_at") or "")
+
+    return sorted(items, key=_sort_key, reverse=True)[:limit]
+
+
+async def admin_stats() -> dict[str, int]:
+    stats = {
+        "total_users": 0,
+        "active_users": 0,
+        "banned_users": 0,
+        "total_balance": 0,
+        "total_deposit": 0,
+        "total_spent": 0,
+        "total_jobs": 0,
+        "failed_jobs": 0,
+    }
+
+    if not mongo_available():
+        docs = list(_load_json_accounts().values())
+        for doc in docs:
+            normalize_account(doc)
+            stats["total_users"] += 1
+            if str(doc.get("status", "active")).lower() == "banned":
+                stats["banned_users"] += 1
+            else:
+                stats["active_users"] += 1
+            stats["total_balance"] += balance_credit(doc)
+            stats["total_deposit"] += int(doc.get("total_deposit", 0))
+            stats["total_spent"] += total_spent(doc)
+            jobs = doc.get("jobs", [])
+            if isinstance(jobs, list):
+                stats["total_jobs"] += len(jobs)
+                stats["failed_jobs"] += sum(
+                    1 for j in jobs
+                    if str(j.get("status", "")).upper() in {"FAILED", "ERROR"}
+                )
+        return stats
+
+    cursor = users_col().find({})
+    async for doc in cursor:
+        doc.pop("_id", None)
+        normalize_account(doc)
+        stats["total_users"] += 1
+        if str(doc.get("status", "active")).lower() == "banned":
+            stats["banned_users"] += 1
+        else:
+            stats["active_users"] += 1
+        stats["total_balance"] += balance_credit(doc)
+        stats["total_deposit"] += int(doc.get("total_deposit", 0))
+        stats["total_spent"] += total_spent(doc)
+        jobs = doc.get("jobs", [])
+        if isinstance(jobs, list):
+            stats["total_jobs"] += len(jobs)
+            stats["failed_jobs"] += sum(
+                1 for j in jobs
+                if str(j.get("status", "")).upper() in {"FAILED", "ERROR"}
+            )
+    return stats
+
+
+# ── Thread-safe job status updates (called from async login worker) ───
+
+async def update_job_status(
+    telegram_id: str,
+    job_id: str,
+    status: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Update a single job's status atomically using MongoDB array filters."""
+    now = datetime.now(timezone.utc).isoformat()
+    if not mongo_available():
+        with _JSON_LOCK:
+            accounts = _load_json_accounts()
+            account = accounts.get(telegram_id)
+            if not account:
+                return
+            for job in account.get("jobs", []):
+                if job.get("id") == job_id:
+                    job["status"] = status
+                    job["updated_at"] = now
+                    if extra:
+                        job.update(extra)
+                    _save_json_accounts(accounts)
+                    return
+        return
+
+    update_fields: dict[str, Any] = {
+        "jobs.$[job].status": status,
+        "jobs.$[job].updated_at": now,
+    }
+    if extra:
+        for k, v in extra.items():
+            update_fields[f"jobs.$[job].{k}"] = v
+
+    await users_col().update_one(
+        {"_id": telegram_id},
+        {"$set": update_fields},
+        array_filters=[{"job.id": job_id}],
+    )
+
+
+async def refund_job(telegram_id: str, job_id: str) -> bool:
+    """Refund the charged credit for a failed job — atomic MongoDB update."""
+    if not mongo_available():
+        with _JSON_LOCK:
+            accounts = _load_json_accounts()
+            doc = accounts.get(telegram_id)
+            if not doc:
+                return False
+            job = next((j for j in doc.get("jobs", []) if j.get("id") == job_id), None)
+            if not job or job.get("refunded") is not None:
+                return False
+            try:
+                charged = int(job.get("charged", 0))
+            except (TypeError, ValueError):
+                charged = 0
+            if charged <= 0:
+                job["refunded"] = 0
+                _save_json_accounts(accounts)
+                return False
+            source = str(job.get("credit_source", ""))
+            if "DEPOSIT" in source:
+                doc["deposit_credit"] = int(doc.get("deposit_credit", 0)) + charged
+                doc["deposit_spent"] = max(0, int(doc.get("deposit_spent", 0)) - charged)
+            else:
+                doc["referral_spent"] = max(0, int(doc.get("referral_spent", 0)) - charged)
+            job["refunded"] = charged
+            _save_json_accounts(accounts)
+        return True
+
+    doc = await _find_user(telegram_id)
+    if not doc:
+        return False
+
+    job = next((j for j in doc.get("jobs", []) if j.get("id") == job_id), None)
+    if not job or job.get("refunded") is not None:
+        return False
+
+    try:
+        charged = int(job.get("charged", 0))
+    except (TypeError, ValueError):
+        charged = 0
+
+    if charged <= 0:
+        await users_col().update_one(
+            {"_id": telegram_id},
+            {"$set": {"jobs.$[job].refunded": 0}},
+            array_filters=[{"job.id": job_id}],
+        )
+        return False
+
+    source = str(job.get("credit_source", ""))
+    if "DEPOSIT" in source:
+        credit_inc = {"deposit_credit": charged, "deposit_spent": -charged}
+    else:
+        credit_inc = {"referral_spent": -charged}
+
+    await users_col().update_one(
+        {"_id": telegram_id},
+        {
+            "$inc": credit_inc,
+            "$set": {"jobs.$[job].refunded": charged},
+        },
+        array_filters=[{"job.id": job_id}],
+    )
+    return True

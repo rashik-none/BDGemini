@@ -1,0 +1,3 @@
+[submodule "invisible_playwright"]
+	path = invisible_playwright
+	url = https://github.com/feder-cr/invisible_playwright.git

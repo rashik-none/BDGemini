@@ -1,0 +1,12 @@
+# Telegram Bot
+python-telegram-bot>=21.0
+
+# Browser automation
+playwright>=1.40.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Database
+motor>=3.3.0
+pymongo>=4.6.0
