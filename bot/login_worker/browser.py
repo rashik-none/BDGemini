@@ -47,8 +47,8 @@ _GOOGLE_CRITICAL_HOSTS = (
 
 
 def _should_block_request(url: str, resource_type: str) -> bool:
-    lowered_url = str(url).lower()
-    lowered_resource_type = str(resource_type).lower()
+    lowered_url = url.lower()
+    lowered_resource_type = resource_type.lower()
 
     # Never block anything from critical Google domains
     if any(host in lowered_url for host in _GOOGLE_CRITICAL_HOSTS):

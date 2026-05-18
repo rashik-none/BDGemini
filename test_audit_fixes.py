@@ -214,11 +214,19 @@ class HandlerSecretTests(unittest.IsolatedAsyncioTestCase):
             handlers.get_account = original_get_account
 
     async def test_sensitive_text_messages_are_deleted_when_saved(self) -> None:
-        update = _FakeUpdate(text="pw")
-        context = _FakeContext({"awaiting_verify_password": True})
-        await handlers.handle_text(update, context)
-        self.assertTrue(update.effective_message.deleted)
-        self.assertEqual(context.user_data["verify_password"], "pw")
+        original_get_account = handlers.get_account
+        try:
+            async def fake_get_account(_telegram_id: str) -> dict:
+                return accounts.default_account()
+
+            handlers.get_account = fake_get_account
+            update = _FakeUpdate(text="pw")
+            context = _FakeContext({"awaiting_verify_password": True})
+            await handlers.handle_text(update, context)
+            self.assertTrue(update.effective_message.deleted)
+            self.assertEqual(context.user_data["verify_password"], "pw")
+        finally:
+            handlers.get_account = original_get_account
 
 
 if __name__ == "__main__":
