@@ -94,7 +94,17 @@ async def _mask_sensitive_inputs(page: Any) -> None:
 
 
 def _mask_email(email: str) -> str:
-    return email
+    email = email.strip()
+    if "@" not in email:
+        return email
+    local, domain = email.split("@", 1)
+    if not local:
+        return f"*@{domain}"
+    if len(local) <= 2:
+        masked_local = local[0] + "*"
+    else:
+        masked_local = f"{local[0]}{'*' * min(len(local) - 2, 5)}{local[-1]}"
+    return f"{masked_local}@{domain}"
 
 
 def _safe_proxy_label(proxy: dict[str, str] | None) -> str:

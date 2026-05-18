@@ -42,6 +42,7 @@ def _csv_env(name: str, default: tuple[str, ...]) -> set[str]:
 
 MAX_RETRIES = _int_env("LOGIN_MAX_RETRIES", 2, minimum=0)
 DEVICE_PROMPT_TIMEOUT = _int_env("DEVICE_PROMPT_TIMEOUT", 90, minimum=5)  # seconds
+LOGIN_NAVIGATION_TIMEOUT_MS = _int_env("LOGIN_NAVIGATION_TIMEOUT_MS", 75000, minimum=10000)
 DEBUG_SCREENSHOTS = _bool_env("DEBUG_SCREENSHOTS", default=False)
 BLOCK_HEAVY_RESOURCES = _bool_env("BLOCK_HEAVY_RESOURCES", default=True)
 BLOCK_TRACKERS = _bool_env("BLOCK_TRACKERS", default=True)

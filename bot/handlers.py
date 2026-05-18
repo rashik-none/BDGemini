@@ -140,6 +140,15 @@ def clear_input_state(context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data.pop(key, None)
 
 
+async def delete_sensitive_message(update: Update) -> None:
+    if not update.effective_message:
+        return
+    try:
+        await update.effective_message.delete()
+    except Exception:
+        logger.debug("Could not delete sensitive user message", exc_info=True)
+
+
 def valid_gmail(value: str) -> bool:
     return bool(GMAIL_RE.fullmatch(value.strip()))
 
@@ -371,6 +380,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         password = context.user_data.get("verify_password", "")
         method_key = query.data
         method = VERIFY_METHODS[method_key]
+        worker_method = method
+        persisted_method = method
 
         if not gmail:
             clear_input_state(context)
@@ -403,7 +414,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     cancel_keyboard(),
                 )
                 return
-            method = f"2FA Secret:{totp_secret}"
+            worker_method = f"2FA Secret:{totp_secret}"
+            persisted_method = "2FA Secret"
 
         chat_id = callback_chat_id(update, query)
         if chat_id is None:
@@ -415,7 +427,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        charged, credit_source = charge_account(account, VERIFY_PRICE)
+        charged, credit_source, charged_deposit, charged_referral = charge_account(account, VERIFY_PRICE)
         if not charged:
             clear_input_state(context)
             await edit_message(
@@ -426,7 +438,15 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        job = create_job(account, str(gmail), method, VERIFY_PRICE, credit_source)
+        job = create_job(
+            account,
+            str(gmail),
+            persisted_method,
+            VERIFY_PRICE,
+            credit_source,
+            charged_deposit,
+            charged_referral,
+        )
         await save_account(telegram_id, account)
         password_to_use = str(password)
         clear_input_state(context)
@@ -449,7 +469,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             start_login_job(
                 gmail=str(gmail),
                 password=password_to_use,
-                method=method,
+                method=worker_method,
                 job_id=str(job["id"]),
                 telegram_id=telegram_id,
                 bot=context.bot,
@@ -590,13 +610,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=admin_keyboard(),
             )
             return
+        safe_message = escape(message)
         sent = 0
         failed = 0
         for target_id in await list_account_ids():
             try:
                 await context.bot.send_message(
                     chat_id=int(target_id),
-                    text=message,
+                    text=safe_message,
                     parse_mode="HTML",
                 )
                 sent += 1
@@ -647,6 +668,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=cancel_keyboard(),
             )
             return
+        await delete_sensitive_message(update)
         context.user_data["verify_password"] = password
         context.user_data.pop("awaiting_verify_password", None)
         await update.effective_message.reply_html(
@@ -670,6 +692,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=cancel_keyboard(),
             )
             return
+        await delete_sensitive_message(update)
         context.user_data["verify_totp_secret"] = secret.upper()
         context.user_data.pop("awaiting_totp_secret", None)
         context.user_data.pop("verify_method", None)

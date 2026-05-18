@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import random
+import sys
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -13,37 +15,12 @@ from .config import (
     BLOCKED_RESOURCE_TYPES,
 )
 
-# Import config first so the local invisible_playwright src path is available.
-from invisible_playwright.async_api import async_playwright
+# config.py already inserts invisible_playwright/src into sys.path
+from invisible_playwright.async_api import InvisiblePlaywright
 
+logger = logging.getLogger(__name__)
 
-_STEALTH_JS = """
-// Remove webdriver flag
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-// Spoof plugins (real Chrome has at least a few)
-Object.defineProperty(navigator, 'plugins', {
-  get: () => [1, 2, 3, 4, 5],
-});
-
-// Spoof languages
-Object.defineProperty(navigator, 'languages', {
-  get: () => ['en-US', 'en'],
-});
-
-// Override permissions query to not reveal automation
-const originalQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (parameters) => (
-  parameters.name === 'notifications'
-    ? Promise.resolve({ state: Notification.permission })
-    : originalQuery(parameters)
-);
-
-// Hide headless chrome signals
-if (window.chrome === undefined) {
-  window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
-}
-"""
+# ── Resource blocking ───────────────────────────────────────────────────────
 
 _TRACKER_URL_MARKERS = (
     "google-analytics",
@@ -56,15 +33,26 @@ _TRACKER_URL_MARKERS = (
     "telemetry",
 )
 
-
-async def _add_stealth(context: Any) -> None:
-    """Inject stealth patches into every new page."""
-    await context.add_init_script(_STEALTH_JS)
+# These Google domains must NEVER have their resources blocked — blocking
+# scripts/stylesheets here breaks the login UI or offer-claim flow.
+_GOOGLE_CRITICAL_HOSTS = (
+    "accounts.google.com",
+    "one.google.com",
+    "myaccount.google.com",
+    "store.google.com",
+    "apis.google.com",
+    "gstatic.com",
+    "google.com/recaptcha",
+)
 
 
 def _should_block_request(url: str, resource_type: str) -> bool:
     lowered_url = str(url).lower()
     lowered_resource_type = str(resource_type).lower()
+
+    # Never block anything from critical Google domains
+    if any(host in lowered_url for host in _GOOGLE_CRITICAL_HOSTS):
+        return False
 
     if BLOCK_HEAVY_RESOURCES and lowered_resource_type in BLOCKED_RESOURCE_TYPES:
         return True
@@ -76,76 +64,106 @@ def _should_block_request(url: str, resource_type: str) -> bool:
 
 
 async def _block_heavy_resources(context: Any) -> None:
-    """Block heavy or tracking requests to reduce metered proxy usage."""
+    """Block heavy/tracking requests while protecting Google critical paths."""
     if not BLOCK_HEAVY_RESOURCES and not BLOCK_TRACKERS:
         return
 
     async def route_handler(route: Any) -> None:
-        request = route.request
-        if _should_block_request(request.url, request.resource_type):
-            await route.abort()
-            return
-        await route.continue_()
+        try:
+            request = route.request
+            if _should_block_request(request.url, request.resource_type):
+                await route.abort()
+            else:
+                await route.continue_()
+        except Exception:
+            # Route may already be handled (page navigated away). Ignore.
+            pass
 
     await context.route("**/*", route_handler)
 
+
+# ── Timing helper ───────────────────────────────────────────────────────────
 
 async def _random_pause(page: Any, lo: int = 300, hi: int = 900) -> None:
     """Introduce a human-like pause between actions."""
     await page.wait_for_timeout(random.randint(lo, hi))
 
 
+# ── Browser launcher ────────────────────────────────────────────────────────
+
 @asynccontextmanager
 async def _launch_android_browser(proxy: dict[str, str] | None):
-    """Launch Chromium because Firefox/invisible_playwright cannot use is_mobile."""
-    playwright = await async_playwright().start()
-    browser = None
+    """Launch InvisiblePlaywright (patched Firefox) for maximum stealth.
+
+    WHY FIREFOX, NOT CHROME?
+    ─────────────────────────
+    Regular Playwright Chromium is trivially detected by Google:
+      • navigator.webdriver = true (even with flags)
+      • headless-specific timing, GPU & rendering signatures
+      • No real plugin/codec fingerprint
+
+    invisible_playwright patches Firefox at the C++ level (Gecko source),
+    not via JS overrides. reCAPTCHA v3 score: 0.90/1.0 vs ~0.3-0.5
+    for patched Chromium. Google classifies the session as "very likely human".
+
+    HEADLESS ON WINDOWS
+    ────────────────────
+    invisible_playwright uses _WindowsVirtualDesktop (CreateDesktop via
+    pywin32/ctypes) to run Firefox headed on a hidden desktop — it avoids
+    the divergent code paths that headless=True triggers inside Gecko,
+    which are fingerprinted by anti-bot systems.
+    Requires: pywin32  (pip install pywin32)
+
+    MOBILE SPOOFING
+    ────────────────
+    Firefox does NOT support Playwright's is_mobile / has_touch context
+    options. We spoof mobile identity via:
+      • general.useragent.override pref  (UA string)
+      • sec-ch-ua / sec-ch-ua-mobile headers  (Client Hints)
+      • viewport + device_scale_factor  (screen size)
+    This is sufficient for Google's login and offer-claim flows.
+    """
+    extra_prefs: dict[str, Any] = {
+        # ── SSL / Proxy MITM bypass ───────────────────────────────────────
+        # Bright Data (and most residential proxies) perform HTTPS inspection
+        # by substituting their own CA cert. These prefs allow that.
+        "network.stricttransportsecurity.preloadlist": False,
+        "security.cert_pinning.enforcement_level": 0,
+        "security.mixed_content.block_active_content": False,
+        "security.mixed_content.block_display_content": False,
+        # Trust the OS/system root certificates (catches proxy CAs installed
+        # at the Windows certificate store level by Bright Data client)
+        "security.enterprise_roots.enabled": True,
+        # ── Mobile UA spoof ───────────────────────────────────────────────
+        "general.useragent.override": ANDROID_USER_AGENT,
+        # ── Performance / stability ───────────────────────────────────────
+        # Disable telemetry pings that waste proxy bandwidth
+        "datareporting.healthreport.uploadEnabled": False,
+        "datareporting.policy.dataSubmissionEnabled": False,
+        "toolkit.telemetry.enabled": False,
+        "toolkit.telemetry.unified": False,
+        # Disable auto-update checks during session
+        "app.update.auto": False,
+        "app.update.enabled": False,
+        # Disable safe-browsing pings (proxy bandwidth)
+        "browser.safebrowsing.malware.enabled": False,
+        "browser.safebrowsing.phishing.enabled": False,
+    }
+
     try:
-        launch_kwargs: dict[str, Any] = {
-            "headless": True,
-            # Bypass SSL cert errors from proxy MITM interception
-            # (some proxy providers replace TLS certs with their own)
-            "ignore_https_errors": True,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--disable-infobars",
-                "--disable-background-networking",
-                "--disable-component-update",
-                "--disable-default-apps",
-                "--disable-extensions",
-                # Ignore TLS/SSL certificate errors (needed for proxy MITM)
-                "--ignore-certificate-errors",
-                "--ignore-ssl-errors",
-                f"--user-agent={ANDROID_USER_AGENT}",
-            ],
-        }
-        if proxy:
-            launch_kwargs["proxy"] = proxy
-
-        last_error: Exception | None = None
-        for channel in (None, "chrome", "msedge"):
-            try:
-                candidate_kwargs = dict(launch_kwargs)
-                if channel:
-                    candidate_kwargs["channel"] = channel
-                browser = await playwright.chromium.launch(**candidate_kwargs)
-                break
-            except Exception as exc:
-                last_error = exc
-
-        if browser is None:
-            raise RuntimeError(
-                "Android mobile mode requires Chromium, Chrome, or Edge. "
-                "Install Playwright Chromium with: python -m playwright install chromium"
-            ) from last_error
-
-        yield browser
-    finally:
-        if browser is not None:
-            try:
-                await browser.close()
-            except Exception:
-                pass
-        await playwright.stop()
+        is_windows = sys.platform == "win32"
+        ipl = InvisiblePlaywright(
+            proxy=proxy,
+            # Windows: SetThreadDesktop fails in asyncio thread, so we launch minimized.
+            # Linux (VPS): Xvfb works perfectly, so we use true headless mode.
+            headless=not is_windows,
+            extra_args=["-min"] if is_windows else [],
+            locale="en-US",
+            timezone="Asia/Dhaka",
+            extra_prefs=extra_prefs,
+            humanize=True,         # Bezier-curve mouse motion baked in binary
+        )
+        async with ipl as browser:
+            yield browser
+    except Exception:
+        raise

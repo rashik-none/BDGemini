@@ -331,6 +331,7 @@ def job_detail_message(job: dict) -> str:
     completed = st in {"SUCCESS", "SUCCEEDED", "COMPLETED"} or bool(job.get("redeem_link"))
     failed = st in {"FAILED", "ERROR"}
     stage = progress_stage(progress, st)
+    raw_email = str(job.get("gmail", ""))
 
     lines = [
         f"{em} <b>Job details</b>",
@@ -344,6 +345,9 @@ def job_detail_message(job: dict) -> str:
         f"💸 Charged: {safe_int(job.get('charged'))} credit",
         f"🏷️ Credit source: <b>{escape(str(job.get('credit_source', 'N/A')))}</b>",
     ]
+
+    if raw_email:
+        lines = [line.replace(raw_email, mask_email(raw_email)) for line in lines]
 
     note = job.get("progress_note", "")
     if note:

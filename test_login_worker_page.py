@@ -4,8 +4,8 @@ import bot.login_worker.page as page
 
 
 class PageHelperTests(unittest.TestCase):
-    def test_mask_email_returns_original_email(self) -> None:
-        self.assertEqual(page._mask_email("person@example.com"), "person@example.com")
+    def test_mask_email_redacts_local_part(self) -> None:
+        self.assertEqual(page._mask_email("person@example.com"), "p****n@example.com")
         self.assertEqual(page._mask_email("not-an-email"), "not-an-email")
 
     def test_safe_proxy_label_hides_credentials(self) -> None:

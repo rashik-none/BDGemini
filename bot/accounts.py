@@ -235,10 +235,10 @@ def add_deposit(account: dict, amount: int) -> None:
     account["total_deposit"] = int(account.get("total_deposit", 0)) + amount
 
 
-def charge_account(account: dict, price: int) -> tuple[bool, str]:
+def charge_account(account: dict, price: int) -> tuple[bool, str, int, int]:
     """Charge the account in-memory. Caller must save afterwards."""
     if balance_credit(account) < price:
-        return False, ""
+        return False, "", 0, 0
 
     deposit_used = min(int(account.get("deposit_credit", 0)), price)
     account["deposit_credit"] = int(account.get("deposit_credit", 0)) - deposit_used
@@ -253,7 +253,7 @@ def charge_account(account: dict, price: int) -> tuple[bool, str]:
         source = "DEPOSIT"
     else:
         source = "REFERRAL"
-    return True, source
+    return True, source, deposit_used, referral_used
 
 
 # ── Job helpers ───────────────────────────────────────────────────────
@@ -264,6 +264,8 @@ def create_job(
     method: str,
     charged: int = 0,
     credit_source: str = "",
+    charged_deposit: int = 0,
+    charged_referral: int = 0,
 ) -> dict:
     job: dict[str, Any] = {
         "id": "cm" + uuid.uuid4().hex[:14],
@@ -272,6 +274,8 @@ def create_job(
         "status": "PENDING",
         "charged": charged,
         "credit_source": credit_source,
+        "charged_deposit": charged_deposit,
+        "charged_referral": charged_referral,
         "progress": 0,
         "progress_note": "",
         "redeem_link": "",
@@ -407,6 +411,28 @@ async def update_job_status(
     )
 
 
+def _refund_split(job: dict) -> tuple[int, int, int]:
+    try:
+        charged = int(job.get("charged", 0))
+    except (TypeError, ValueError):
+        charged = 0
+
+    try:
+        deposit = int(job.get("charged_deposit", 0))
+        referral = int(job.get("charged_referral", 0))
+    except (TypeError, ValueError):
+        deposit = 0
+        referral = 0
+
+    if deposit > 0 or referral > 0:
+        return charged, max(0, deposit), max(0, referral)
+
+    source = str(job.get("credit_source", "")).upper()
+    if "REFERRAL" in source and "DEPOSIT" not in source:
+        return charged, 0, charged
+    return charged, charged, 0
+
+
 async def refund_job(telegram_id: str, job_id: str) -> bool:
     """Refund the charged credit for a failed job — atomic MongoDB update."""
     if not mongo_available():
@@ -418,20 +444,16 @@ async def refund_job(telegram_id: str, job_id: str) -> bool:
             job = next((j for j in doc.get("jobs", []) if j.get("id") == job_id), None)
             if not job or job.get("refunded") is not None:
                 return False
-            try:
-                charged = int(job.get("charged", 0))
-            except (TypeError, ValueError):
-                charged = 0
+            charged, deposit_refund, referral_refund = _refund_split(job)
             if charged <= 0:
                 job["refunded"] = 0
                 _save_json_accounts(accounts)
                 return False
-            source = str(job.get("credit_source", ""))
-            if "DEPOSIT" in source:
-                doc["deposit_credit"] = int(doc.get("deposit_credit", 0)) + charged
-                doc["deposit_spent"] = max(0, int(doc.get("deposit_spent", 0)) - charged)
-            else:
-                doc["referral_spent"] = max(0, int(doc.get("referral_spent", 0)) - charged)
+            if deposit_refund:
+                doc["deposit_credit"] = int(doc.get("deposit_credit", 0)) + deposit_refund
+                doc["deposit_spent"] = max(0, int(doc.get("deposit_spent", 0)) - deposit_refund)
+            if referral_refund:
+                doc["referral_spent"] = max(0, int(doc.get("referral_spent", 0)) - referral_refund)
             job["refunded"] = charged
             _save_json_accounts(accounts)
         return True
@@ -444,31 +466,39 @@ async def refund_job(telegram_id: str, job_id: str) -> bool:
     if not job or job.get("refunded") is not None:
         return False
 
-    try:
-        charged = int(job.get("charged", 0))
-    except (TypeError, ValueError):
-        charged = 0
+    charged, deposit_refund, referral_refund = _refund_split(job)
+    update_filter = {
+        "_id": telegram_id,
+        "jobs": {
+            "$elemMatch": {
+                "id": job_id,
+                "refunded": {"$exists": False},
+            },
+        },
+    }
+    array_filters = [{"job.id": job_id, "job.refunded": {"$exists": False}}]
 
     if charged <= 0:
-        await users_col().update_one(
-            {"_id": telegram_id},
+        result = await users_col().update_one(
+            update_filter,
             {"$set": {"jobs.$[job].refunded": 0}},
-            array_filters=[{"job.id": job_id}],
+            array_filters=array_filters,
         )
-        return False
+        return result.modified_count > 0
 
-    source = str(job.get("credit_source", ""))
-    if "DEPOSIT" in source:
-        credit_inc = {"deposit_credit": charged, "deposit_spent": -charged}
-    else:
-        credit_inc = {"referral_spent": -charged}
+    credit_inc: dict[str, int] = {}
+    if deposit_refund:
+        credit_inc["deposit_credit"] = deposit_refund
+        credit_inc["deposit_spent"] = -deposit_refund
+    if referral_refund:
+        credit_inc["referral_spent"] = -referral_refund
 
-    await users_col().update_one(
-        {"_id": telegram_id},
+    result = await users_col().update_one(
+        update_filter,
         {
             "$inc": credit_inc,
             "$set": {"jobs.$[job].refunded": charged},
         },
-        array_filters=[{"job.id": job_id}],
+        array_filters=array_filters,
     )
-    return True
+    return result.modified_count > 0

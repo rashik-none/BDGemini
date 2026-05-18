@@ -11,7 +11,6 @@ from typing import Any
 
 from .accounts import _refund_job, _update_job_status
 from .browser import (
-    _add_stealth,
     _block_heavy_resources,
     _launch_android_browser,
     _random_pause,
@@ -27,7 +26,7 @@ from .config import (
 from .google_login import (
     _click_first_visible,
     _find_totp_selector,
-    _google_login_url,
+    _goto_google_login,
     _is_google_login_success_url,
     _open_device_prompt_challenge,
     _open_totp_challenge,
@@ -50,6 +49,10 @@ from .totp import _extract_totp_secret, _generate_totp, _is_totp_method
 
 logger = logging.getLogger(__name__)
 
+ATTEMPT_SUCCESS = "success"
+ATTEMPT_TERMINAL = "terminal"
+ATTEMPT_RETRY = "retry"
+
 
 async def _do_login_attempt(
     gmail: str,
@@ -61,8 +64,8 @@ async def _do_login_attempt(
     chat_id: int,
     proxy: dict[str, str] | None,
     attempt: int,
-) -> bool:
-    """Single login attempt.  Returns True on success."""
+) -> str:
+    """Run one login attempt and classify the outcome for the retry loop."""
 
     masked_email = _mask_email(gmail)
     login_email = gmail
@@ -82,22 +85,26 @@ async def _do_login_attempt(
     )
 
     async with _launch_android_browser(proxy) as browser:
+        # Firefox (invisible_playwright) does NOT support is_mobile / has_touch.
+        # Mobile UA is already injected via general.useragent.override pref.
+        # NOTE: ignore_https_errors is also NOT supported by Firefox Playwright
+        #   (throws NS_ERROR_NOT_AVAILABLE). SSL bypass is done via prefs in browser.py.
         context = await browser.new_context(
             user_agent=ANDROID_USER_AGENT,
             viewport=ANDROID_VIEWPORT,
             device_scale_factor=ANDROID_DPR,
-            is_mobile=True,
-            has_touch=True,
             locale="en-US",
             timezone_id="Asia/Dhaka",
             extra_http_headers=CLIENT_HINTS_HEADERS,
-            # Bypass proxy MITM SSL certificate errors
-            ignore_https_errors=True,
         )
         try:
             await _block_heavy_resources(context)
-            await _add_stealth(context)
+            # No _add_stealth needed — invisible_playwright patches at C++ level.
+            # JS overrides would be detectable and hurt reCAPTCHA scores.
             page = await context.new_page()
+            # Residential proxy can be slow — raise all page-level timeouts.
+            page.set_default_navigation_timeout(90_000)  # 90 s
+            page.set_default_timeout(60_000)             # 60 s for selectors
             await _random_pause(page, 1500, 3000)
 
             # ── 1. Navigate ────────────────────────────────────────────
@@ -108,7 +115,7 @@ async def _do_login_attempt(
                 "PROCESSING",
                 {"progress": 10, "progress_note": "Opening Google login…"},
             )
-            await page.goto(_google_login_url(), wait_until="domcontentloaded")
+            await _goto_google_login(page)
             await _wait_for_navigation(page)
             await _screenshot(page, job_id, "01_landing")
 
@@ -138,7 +145,7 @@ async def _do_login_attempt(
                     f"⚠️ <b>Job {html_esc(job_id)}</b>\n"
                     f"Google login did not show email input: <code>{login_state}</code>",
                 )
-                return False
+                return ATTEMPT_RETRY
 
             if login_state == "EMAIL":
                 email_selector = await _wait_for_visible_selector(
@@ -147,7 +154,7 @@ async def _do_login_attempt(
                     timeout=20000,
                 )
                 if not email_selector:
-                    return False
+                    return ATTEMPT_RETRY
                 await _human_type(page, email_selector, login_email)
                 login_email = ""
 
@@ -176,7 +183,7 @@ async def _do_login_attempt(
                     f"⚠️ <b>Job {html_esc(job_id)}</b>\n"
                     f"Challenge after email: <code>{login_state}</code>",
                 )
-                return False
+                return ATTEMPT_RETRY
 
             # ── 3. Password ───────────────────────────────────────────
             if login_state == "SUCCESS":
@@ -189,7 +196,7 @@ async def _do_login_attempt(
                         f"⚠️ <b>Job {html_esc(job_id)}</b>\n"
                         f"Password input not reached: <code>{login_state}</code>",
                     )
-                    return False
+                    return ATTEMPT_RETRY
 
                 logger.info("[%s] → password", job_id)
                 await _update_job_status(
@@ -218,7 +225,7 @@ async def _do_login_attempt(
                         f"⚠️ <b>Job {html_esc(job_id)}</b>\n"
                         "Password field not found.",
                     )
-                    return False
+                    return ATTEMPT_RETRY
 
                 await _random_pause(page, 400, 1000)
                 await _human_type(page, pwd_selector, login_password)
@@ -269,8 +276,8 @@ async def _do_login_attempt(
                             "Login failed — wrong password.\n\n"
                             "▶️ 1 credit has been refunded to your balance.",
                         )
-                        return True
-                    return False
+                        return ATTEMPT_TERMINAL
+                    return ATTEMPT_RETRY
 
             # ── 4. Verification method ─────────────────────────────────
             await _update_job_status(
@@ -305,7 +312,7 @@ async def _do_login_attempt(
                         "2FA Secret method selected, but no TOTP secret was provided.\n\n"
                         "▶️ 1 credit has been refunded to your balance.",
                     )
-                    return True
+                    return ATTEMPT_TERMINAL
 
                 totp_selector = await _find_totp_selector(page, timeout=8000)
                 if not totp_selector:
@@ -332,7 +339,7 @@ async def _do_login_attempt(
                             "Invalid TOTP secret. Please provide a valid base32 secret.\n\n"
                             "▶️ 1 credit has been refunded to your balance.",
                         )
-                        return True
+                        return ATTEMPT_TERMINAL
 
                     await _human_type(page, totp_selector, totp_code)
                     totp_code = ""
@@ -486,11 +493,11 @@ async def _do_login_attempt(
                         "1 credit has been refunded to your balance.",
                     )
 
-                return True
+                return ATTEMPT_SUCCESS if claim_result in {"CLAIMED", "ALREADY_ACTIVE"} else ATTEMPT_TERMINAL
 
             # Not on success page
             logger.warning("[%s] ✗ ended on %s", job_id, current_url)
-            return False
+            return ATTEMPT_RETRY
 
 
         finally:
@@ -531,7 +538,7 @@ async def _run_login_job(
             proxy = _pick_proxy(proxies, attempt)
 
             try:
-                done = await _do_login_attempt(
+                attempt_result = await _do_login_attempt(
                     gmail,
                     password,
                     method,
@@ -542,7 +549,7 @@ async def _run_login_job(
                     proxy,
                     attempt,
                 )
-                if done:
+                if attempt_result in {ATTEMPT_SUCCESS, ATTEMPT_TERMINAL}:
                     return
                 last_error = "login_flow_failed"
 

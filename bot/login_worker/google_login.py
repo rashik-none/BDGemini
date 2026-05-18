@@ -12,6 +12,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from .config import (
     _DEVICE_PROMPT_MARKERS,
     _TRY_ANOTHER_WAY_MARKERS,
+    LOGIN_NAVIGATION_TIMEOUT_MS,
 )
 from .page import _check_markers, _detect_challenge, _page_text
 
@@ -34,6 +35,37 @@ def _google_login_url() -> str:
         }
     )
     return f"https://accounts.google.com/signin/v2/identifier?{query}"
+
+
+async def _goto_google_login(page: Any, attempts: int = 2) -> None:
+    """Open Google's login page with proxy-tolerant navigation handling."""
+    url = _google_login_url()
+    last_error: Exception | None = None
+
+    for attempt in range(attempts):
+        try:
+            await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=LOGIN_NAVIGATION_TIMEOUT_MS,
+            )
+            return
+        except PlaywrightTimeoutError as exc:
+            last_error = exc
+            state = await _google_login_state(page)
+            if state != "UNKNOWN":
+                return
+            if attempt < attempts - 1:
+                await page.wait_for_timeout(2000)
+                continue
+        except PlaywrightError as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                await page.wait_for_timeout(2000)
+                continue
+
+    if last_error:
+        raise last_error
 
 
 def _is_google_login_success_url(url: str) -> bool:
