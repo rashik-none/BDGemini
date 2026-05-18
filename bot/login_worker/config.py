@@ -11,6 +11,8 @@ LOCAL_INVISIBLE_PLAYWRIGHT_SRC = PROJECT_ROOT / "invisible_playwright" / "src"
 if LOCAL_INVISIBLE_PLAYWRIGHT_SRC.exists() and str(LOCAL_INVISIBLE_PLAYWRIGHT_SRC) not in sys.path:
     sys.path.insert(0, str(LOCAL_INVISIBLE_PLAYWRIGHT_SRC))
 
+from invisible_playwright.device_profiles import get_device_profile
+
 ACCOUNTS_FILE = PROJECT_ROOT / "accounts.json"
 SCREENSHOTS_DIR = PROJECT_ROOT / "screenshots"
 SCREENSHOTS_DIR.mkdir(exist_ok=True)
@@ -41,8 +43,10 @@ def _csv_env(name: str, default: tuple[str, ...]) -> set[str]:
 
 
 MAX_RETRIES = _int_env("LOGIN_MAX_RETRIES", 2, minimum=0)
+GOOGLE_LOGIN_ATTEMPTS = _int_env("GOOGLE_LOGIN_ATTEMPTS", 2, minimum=1)
 DEVICE_PROMPT_TIMEOUT = _int_env("DEVICE_PROMPT_TIMEOUT", 90, minimum=5)  # seconds
-LOGIN_NAVIGATION_TIMEOUT_MS = _int_env("LOGIN_NAVIGATION_TIMEOUT_MS", 75000, minimum=10000)
+LOGIN_NAVIGATION_TIMEOUT_MS = _int_env("LOGIN_NAVIGATION_TIMEOUT_MS", 45000, minimum=10000)
+POST_ACTION_SETTLE_MS = _int_env("POST_ACTION_SETTLE_MS", 800, minimum=0)
 DEBUG_SCREENSHOTS = _bool_env("DEBUG_SCREENSHOTS", default=False)
 BLOCK_HEAVY_RESOURCES = _bool_env("BLOCK_HEAVY_RESOURCES", default=True)
 BLOCK_TRACKERS = _bool_env("BLOCK_TRACKERS", default=True)
@@ -50,25 +54,14 @@ BLOCKED_RESOURCE_TYPES = _csv_env("BLOCKED_RESOURCE_TYPES", ("image", "media", "
 # ── Pixel 10 Pro device fingerprint ────────────────────────────────
 # Modern Chrome on Android uses "reduced" User-Agent (Android 10; K)
 # with NO device model.  The real identity is conveyed via Client Hints.
-_CHROME_MAJOR = "136"  # keep in sync with a recent stable release
-ANDROID_USER_AGENT = (
-    f"Mozilla/5.0 (Linux; Android 10; K) "
-    f"AppleWebKit/537.36 (KHTML, like Gecko) "
-    f"Chrome/{_CHROME_MAJOR}.0.0.0 Mobile Safari/537.36"
-)
-ANDROID_VIEWPORT = {"width": 410, "height": 914}   # real Pixel 10 Pro CSS viewport
-ANDROID_DPR = 3.125                                 # real device pixel ratio
+PIXEL_10_PRO_PROFILE = get_device_profile("pixel_10_pro")
+ANDROID_USER_AGENT = PIXEL_10_PRO_PROFILE.user_agent
+ANDROID_VIEWPORT = dict(PIXEL_10_PRO_PROFILE.viewport)
+ANDROID_DPR = PIXEL_10_PRO_PROFILE.device_scale_factor
 
 # Client Hints that a real Pixel 10 Pro sends.
 # Google reads these to determine device eligibility for offers.
-CLIENT_HINTS_HEADERS = {
-    "sec-ch-ua": f'"Chromium";v="{_CHROME_MAJOR}", "Google Chrome";v="{_CHROME_MAJOR}", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?1",
-    "sec-ch-ua-platform": '"Android"',
-    "sec-ch-ua-platform-version": '"16.0.0"',
-    "sec-ch-ua-model": '"Pixel 10 Pro"',
-    "sec-ch-ua-full-version-list": f'"Chromium";v="{_CHROME_MAJOR}.0.7103.60", "Google Chrome";v="{_CHROME_MAJOR}.0.7103.60", "Not-A.Brand";v="99.0.0.0"',
-}
+CLIENT_HINTS_HEADERS = dict(PIXEL_10_PRO_PROFILE.extra_http_headers)
 
 # Google error markers we look for after each step
 _WRONG_PASSWORD_MARKERS = [

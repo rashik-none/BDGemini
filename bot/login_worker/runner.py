@@ -9,6 +9,7 @@ import time
 from html import escape as html_esc
 from typing import Any
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .accounts import _refund_job, _update_job_status
@@ -17,14 +18,7 @@ from .browser import (
     _launch_android_browser,
     _random_pause,
 )
-from .config import (
-    ANDROID_DPR,
-    ANDROID_USER_AGENT,
-    ANDROID_VIEWPORT,
-    CLIENT_HINTS_HEADERS,
-    DEVICE_PROMPT_TIMEOUT,
-    MAX_RETRIES,
-)
+from .config import DEVICE_PROMPT_TIMEOUT, GOOGLE_LOGIN_ATTEMPTS, MAX_RETRIES
 from .google_login import (
     _click_first_visible,
     _find_totp_selector,
@@ -54,6 +48,18 @@ logger = logging.getLogger(__name__)
 ATTEMPT_SUCCESS = "success"
 ATTEMPT_TERMINAL = "terminal"
 ATTEMPT_RETRY = "retry"
+_RETRY_SEPARATOR = ":"
+
+
+def _retry(reason: str) -> str:
+    return f"{ATTEMPT_RETRY}{_RETRY_SEPARATOR}{reason}"
+
+
+def _retry_reason(result: str) -> str:
+    prefix = f"{ATTEMPT_RETRY}{_RETRY_SEPARATOR}"
+    if result.startswith(prefix):
+        return result[len(prefix):]
+    return "login_flow_failed"
 
 
 async def _do_login_attempt(
@@ -91,16 +97,10 @@ async def _do_login_attempt(
         # Mobile UA is already injected via general.useragent.override pref.
         # NOTE: ignore_https_errors is also NOT supported by Firefox Playwright
         #   (throws NS_ERROR_NOT_AVAILABLE). SSL bypass is done via prefs in browser.py.
-        context = await browser.new_context(
-            user_agent=ANDROID_USER_AGENT,
-            viewport=ANDROID_VIEWPORT,
-            device_scale_factor=ANDROID_DPR,
-            locale="en-US",
-            timezone_id="Asia/Dhaka",
-            extra_http_headers=CLIENT_HINTS_HEADERS,
-        )
+        context = await browser.new_context()
         try:
-            await _block_heavy_resources(context)
+            if proxy:
+                await _block_heavy_resources(context)
             # No _add_stealth needed — invisible_playwright patches at C++ level.
             # JS overrides would be detectable and hurt reCAPTCHA scores.
             page = await context.new_page()
@@ -130,7 +130,7 @@ async def _do_login_attempt(
                 f"{_conn_note}",
             )
             try:
-                await _goto_google_login(page)
+                await _goto_google_login(page, attempts=GOOGLE_LOGIN_ATTEMPTS)
             except PlaywrightTimeoutError:
                 proxy_label = _safe_proxy_label(proxy)
                 logger.warning("[%s] Navigation timeout — proxy=%s", job_id, proxy_label)
@@ -152,7 +152,7 @@ async def _do_login_attempt(
                         f"Please check your internet connection.\n\n"
                         f"⏩ Trying next attempt…",
                     )
-                return ATTEMPT_RETRY
+                return _retry(f"Navigation timeout: {proxy_label}")
             await _wait_for_navigation(page)
             await _screenshot(page, job_id, "01_landing")
 
@@ -172,41 +172,71 @@ async def _do_login_attempt(
                 "Submitting email and waiting for Google's next step.",
             )
 
-            login_state = await _wait_for_google_login_state(page, {"EMAIL", "SUCCESS"}, timeout=20000)
-            if login_state == "SUCCESS":
-                logger.info("[%s] existing Google session detected", job_id)
-            elif login_state != "EMAIL":
-                await _screenshot(page, job_id, f"02_unexpected_{login_state}")
+            try:
+                login_state = await _wait_for_google_login_state(page, {"EMAIL", "SUCCESS"}, timeout=20000)
+                logger.info("[%s] email phase state=%s url=%s", job_id, login_state, page.url)
+                if login_state == "SUCCESS":
+                    logger.info("[%s] existing Google session detected", job_id)
+                elif login_state != "EMAIL":
+                    await _screenshot(page, job_id, f"02_unexpected_{login_state}")
+                    await _notify(
+                        bot, chat_id,
+                        f"⚠️ <b>Job {html_esc(job_id)}</b>\n"
+                        f"Google login did not show email input: <code>{login_state}</code>",
+                    )
+                    return _retry(f"Email input not ready: {login_state}")
+
+                if login_state == "EMAIL":
+                    email_selector = await _wait_for_visible_selector(
+                        page,
+                        ['input[type="email"]', "#identifierId"],
+                        timeout=20000,
+                    )
+                    if not email_selector:
+                        await _screenshot(page, job_id, "02_no_email_field")
+                        await _notify(
+                            bot, chat_id,
+                            f"âš ï¸ <b>Job {html_esc(job_id)}</b>\n"
+                            "Google email field was not visible. Retrying with a fresh session.",
+                        )
+                        return _retry("Google email field was not visible")
+                    logger.info("[%s] typing email using selector=%s", job_id, email_selector)
+                    await _human_type(page, email_selector, login_email)
+                    login_email = ""
+
+                    clicked = await _click_first_visible(
+                        page,
+                        [
+                            "#identifierNext",
+                            "div[role='button']:has-text('Next')",
+                            "button:has-text('Next')",
+                            "input[type='submit']",
+                        ],
+                        timeout=8000,
+                    )
+                    if not clicked:
+                        await page.keyboard.press("Enter")
+                    await _wait_for_navigation(page)
+                    await _screenshot(page, job_id, "02_email_submitted")
+            except Exception as exc:
+                last_error = _redact_sensitive(
+                    f"{type(exc).__name__}: {exc}",
+                    gmail,
+                    login_email,
+                    login_password,
+                    verification_method,
+                )
+                logger.warning("[%s] email phase failed: %s", job_id, last_error)
+                await _screenshot(page, job_id, "02_email_error")
                 await _notify(
-                    bot, chat_id,
-                    f"⚠️ <b>Job {html_esc(job_id)}</b>\n"
-                    f"Google login did not show email input: <code>{login_state}</code>",
+                    bot,
+                    chat_id,
+                    f"⚠️ <b>Job {html_esc(job_id)}</b>\n\n"
+                    "<b>Email step failed</b>\n"
+                    f"<code>{html_esc(last_error[:180])}</code>\n\n"
+                    "Trying again with a fresh browser session.",
                 )
-                return ATTEMPT_RETRY
-
-            if login_state == "EMAIL":
-                email_selector = await _wait_for_visible_selector(
-                    page,
-                    ['input[type="email"]', "#identifierId"],
-                    timeout=20000,
-                )
-                if not email_selector:
-                    return ATTEMPT_RETRY
-                await _human_type(page, email_selector, login_email)
-                login_email = ""
-
-                clicked = await _click_first_visible(
-                    page,
-                    [
-                        "#identifierNext",
-                        "button:has-text('Next')",
-                        "input[type='submit']",
-                    ],
-                    timeout=8000,
-                )
-                if not clicked:
-                    await page.keyboard.press("Enter")
-                await _wait_for_navigation(page)
+                return _retry(f"Email step failed: {last_error[:160]}")
 
             login_state = await _wait_for_google_login_state(
                 page,
@@ -220,7 +250,7 @@ async def _do_login_attempt(
                     f"⚠️ <b>Job {html_esc(job_id)}</b>\n"
                     f"Challenge after email: <code>{login_state}</code>",
                 )
-                return ATTEMPT_RETRY
+                return _retry(f"Challenge after email: {login_state}")
 
             # ── 3. Password ───────────────────────────────────────────
             if login_state == "SUCCESS":
@@ -233,7 +263,7 @@ async def _do_login_attempt(
                         f"⚠️ <b>Job {html_esc(job_id)}</b>\n"
                         f"Password input not reached: <code>{login_state}</code>",
                     )
-                    return ATTEMPT_RETRY
+                    return _retry(f"Password input not reached: {login_state}")
 
                 logger.info("[%s] → password", job_id)
                 await _update_job_status(
@@ -262,32 +292,56 @@ async def _do_login_attempt(
                         f"⚠️ <b>Job {html_esc(job_id)}</b>\n"
                         "Password field not found.",
                     )
-                    return ATTEMPT_RETRY
+                    return _retry("Password field not found")
 
-                await _random_pause(page, 400, 1000)
-                await _human_type(page, pwd_selector, login_password)
-                login_password = ""
+                try:
+                    await _random_pause(page, 400, 1000)
+                    await _human_type(page, pwd_selector, login_password)
+                    login_password = ""
+                    await _screenshot(page, job_id, "04_password_typed")
 
-                clicked = await _click_first_visible(
-                    page,
-                    [
-                        "#passwordNext",
-                        "button:has-text('Next')",
-                        "button:has-text('Verify')",
-                        "input[type='submit']",
-                    ],
-                    timeout=8000,
-                )
-                if not clicked:
-                    await page.keyboard.press("Enter")
-                await _wait_for_navigation(page)
-                await _random_pause(page, 2000, 4000)
+                    clicked = await _click_first_visible(
+                        page,
+                        [
+                            "#passwordNext",
+                            "div[role='button']:has-text('Next')",
+                            "button:has-text('Next')",
+                            "div[role='button']:has-text('Verify')",
+                            "button:has-text('Verify')",
+                            "input[type='submit']",
+                        ],
+                        timeout=8000,
+                    )
+                    if not clicked:
+                        await page.keyboard.press("Enter")
+                    await _wait_for_navigation(page)
+                    await _random_pause(page, 2000, 4000)
+                    await _screenshot(page, job_id, "05_password_submitted")
 
-                login_state = await _wait_for_google_login_state(
-                    page,
-                    {"SUCCESS", "TOTP", "DEVICE_PROMPT", "TRY_ANOTHER_WAY"},
-                    timeout=30000,
-                )
+                    login_state = await _wait_for_google_login_state(
+                        page,
+                        {"SUCCESS", "TOTP", "DEVICE_PROMPT", "TRY_ANOTHER_WAY"},
+                        timeout=30000,
+                    )
+                except Exception as exc:
+                    last_error = _redact_sensitive(
+                        f"{type(exc).__name__}: {exc}",
+                        gmail,
+                        login_email,
+                        login_password,
+                        verification_method,
+                    )
+                    logger.warning("[%s] password phase failed: %s", job_id, last_error)
+                    await _screenshot(page, job_id, "05_password_error")
+                    await _notify(
+                        bot,
+                        chat_id,
+                        f"âš ï¸ <b>Job {html_esc(job_id)}</b>\n\n"
+                        "<b>Password step failed</b>\n"
+                        f"<code>{html_esc(last_error[:180])}</code>\n\n"
+                        "Trying again with a fresh browser session.",
+                    )
+                    return _retry(f"Password step failed: {last_error[:160]}")
                 if login_state in {"WRONG_PASSWORD", "ACCOUNT_LOCKED", "CAPTCHA", "UNUSUAL_ACTIVITY"}:
                     await _screenshot(page, job_id, f"05_challenge_{login_state}")
                     await _notify(
@@ -314,7 +368,7 @@ async def _do_login_attempt(
                             "▶️ 1 credit has been refunded to your balance.",
                         )
                         return ATTEMPT_TERMINAL
-                    return ATTEMPT_RETRY
+                    return _retry(f"Challenge after password: {login_state}")
 
             # ── 4. Verification method ─────────────────────────────────
             await _update_job_status(
@@ -534,7 +588,7 @@ async def _do_login_attempt(
 
             # Not on success page
             logger.warning("[%s] ✗ ended on %s", job_id, current_url)
-            return ATTEMPT_RETRY
+            return _retry(f"Login did not reach success page: {current_url[:120]}")
 
 
         finally:
@@ -588,12 +642,16 @@ async def _run_login_job(
                 )
                 if attempt_result in {ATTEMPT_SUCCESS, ATTEMPT_TERMINAL}:
                     return
-                last_error = "login_flow_failed"
+                last_error = _retry_reason(attempt_result)
 
             except PlaywrightTimeoutError as exc:
                 # Navigation-level timeout — likely a dead proxy; give friendly message
                 proxy_label = _safe_proxy_label(proxy)
-                last_error = f"Proxy timeout: {proxy_label}"
+                last_error = (
+                    f"Proxy/browser timeout: {proxy_label}"
+                    if proxy
+                    else "Browser action timeout on direct connection"
+                )
                 logger.warning("[%s] attempt %d proxy timeout: %s", job_id, attempt, proxy_label)
                 await _notify(
                     bot, chat_id,

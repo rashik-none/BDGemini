@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from .config import (
-    ANDROID_USER_AGENT,
     BLOCK_HEAVY_RESOURCES,
     BLOCK_TRACKERS,
     BLOCKED_RESOURCE_TYPES,
@@ -127,6 +126,9 @@ async def _launch_android_browser(proxy: dict[str, str] | None):
         # ── SSL / Proxy MITM bypass ───────────────────────────────────────
         # Bright Data (and most residential proxies) perform HTTPS inspection
         # by substituting their own CA cert. These prefs allow that.
+        # NOTE: telemetry, safebrowsing, update, and mobile-UA prefs are
+        # already set by _BASELINE and the pixel_10_pro device profile —
+        # they are NOT repeated here to avoid duplicated constants drifting.
         "network.stricttransportsecurity.preloadlist": False,
         "security.cert_pinning.enforcement_level": 0,
         "security.mixed_content.block_active_content": False,
@@ -134,26 +136,13 @@ async def _launch_android_browser(proxy: dict[str, str] | None):
         # Trust the OS/system root certificates (catches proxy CAs installed
         # at the Windows certificate store level by Bright Data client)
         "security.enterprise_roots.enabled": True,
-        # ── Mobile UA spoof ───────────────────────────────────────────────
-        "general.useragent.override": ANDROID_USER_AGENT,
-        # ── Performance / stability ───────────────────────────────────────
-        # Disable telemetry pings that waste proxy bandwidth
-        "datareporting.healthreport.uploadEnabled": False,
-        "datareporting.policy.dataSubmissionEnabled": False,
-        "toolkit.telemetry.enabled": False,
-        "toolkit.telemetry.unified": False,
-        # Disable auto-update checks during session
-        "app.update.auto": False,
-        "app.update.enabled": False,
-        # Disable safe-browsing pings (proxy bandwidth)
-        "browser.safebrowsing.malware.enabled": False,
-        "browser.safebrowsing.phishing.enabled": False,
     }
 
     try:
         is_windows = sys.platform == "win32"
         ipl = InvisiblePlaywright(
             proxy=proxy,
+            device_profile="pixel_10_pro",
             # Windows: SetThreadDesktop fails in asyncio thread, so we launch minimized.
             # Linux (VPS): Xvfb works perfectly, so we use true headless mode.
             headless=not is_windows,

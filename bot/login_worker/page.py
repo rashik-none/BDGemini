@@ -9,6 +9,8 @@ import time
 from typing import Any
 from urllib.parse import urlparse
 
+from playwright.async_api import Error as PlaywrightError
+
 from .config import (
     _ACCOUNT_LOCKED_MARKERS,
     _CAPTCHA_MARKERS,
@@ -154,8 +156,45 @@ async def _detect_challenge(page: Any) -> str | None:
 
 
 async def _human_type(page: Any, selector: str, text: str) -> None:
-    """Type text character-by-character with random delays for realism."""
-    el = page.locator(selector)
-    await el.click()
-    await el.fill("")
+    """Type text character-by-character with random delays for realism.
+
+    WHY JS focus() instead of el.click():
+    ───────────────────────────────────────
+    InvisiblePlaywright launches Firefox minimised on Windows (hidden desktop).
+    Playwright's click() internally scrolls the element into the viewport and
+    then re-checks its bounding box. On a minimised/off-screen window the
+    geometry check fails with "element is not visible" even though the element
+    is perfectly stable — it's a known Firefox headless-window quirk.
+
+    Using evaluate() → el.focus() + el.click() bypasses the scroll-geometry
+    check entirely and focuses the input directly, which is all we need before
+    fill() / type().
+    """
+    el = page.locator(selector).first
+    await el.wait_for(state="visible", timeout=10000)
+    # Focus via JS to avoid scroll-geometry failure on minimised Firefox window
+    try:
+        await page.evaluate(
+            "(sel) => { const el = document.querySelector(sel); if (el) { el.focus(); el.click(); } }",
+            selector,
+        )
+    except Exception:
+        # Last-resort fallback: try Playwright click (may fail on minimised window)
+        try:
+            await el.click(timeout=5000)
+        except Exception:
+            pass
+    await el.fill("", timeout=10000)
     await el.type(text, delay=random.randint(40, 120))
+    try:
+        actual = await el.input_value(timeout=5000)
+    except Exception:
+        actual = ""
+    if actual != text:
+        await el.fill(text, timeout=10000)
+        try:
+            actual = await el.input_value(timeout=5000)
+        except Exception:
+            actual = ""
+    if actual != text:
+        raise PlaywrightError("Input value did not match expected text after typing")

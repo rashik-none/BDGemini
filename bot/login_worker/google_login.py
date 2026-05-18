@@ -10,19 +10,23 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .config import (
+    GOOGLE_LOGIN_ATTEMPTS,
     _DEVICE_PROMPT_MARKERS,
     _TRY_ANOTHER_WAY_MARKERS,
     LOGIN_NAVIGATION_TIMEOUT_MS,
+    POST_ACTION_SETTLE_MS,
 )
 from .page import _check_markers, _detect_challenge, _page_text
 
 
-async def _wait_for_navigation(page: Any, timeout: int = 10000) -> None:
-    """Wait for a navigation or network-idle, whichever comes first."""
+async def _wait_for_navigation(page: Any, timeout: int = 5000) -> None:
+    """Wait briefly for document readiness without relying on network idle."""
     try:
-        await page.wait_for_load_state("networkidle", timeout=timeout)
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout)
     except Exception:
-        await page.wait_for_timeout(2000)
+        pass
+    if POST_ACTION_SETTLE_MS:
+        await page.wait_for_timeout(POST_ACTION_SETTLE_MS)
 
 
 def _google_login_url() -> str:
@@ -37,7 +41,7 @@ def _google_login_url() -> str:
     return f"https://accounts.google.com/signin/v2/identifier?{query}"
 
 
-async def _goto_google_login(page: Any, attempts: int = 1) -> None:
+async def _goto_google_login(page: Any, attempts: int = GOOGLE_LOGIN_ATTEMPTS) -> None:
     """Open Google's login page with robust navigation handling.
 
     Strategy:
@@ -65,7 +69,7 @@ async def _goto_google_login(page: Any, attempts: int = 1) -> None:
                 return
             # Page committed but content not ready yet — wait a bit more
             try:
-                await page.wait_for_load_state("domcontentloaded", timeout=20000)
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
             except Exception:
                 pass
             state = await _google_login_state(page)
@@ -136,20 +140,45 @@ async def _click_first_visible(
     selectors: list[str],
     timeout: int = 5000,
 ) -> bool:
+    """Click the first visible element matching any of the given selectors.
+
+    Uses JS focus()+click() as the primary path to avoid the minimised-Firefox
+    viewport geometry bug (scroll-into-view returns 0,0 on a hidden desktop,
+    making Playwright declare the element "not visible" even when it is stable).
+    Falls back to Playwright's el.click() if JS evaluate fails.
+    """
     if not selectors:
         return False
-    loc = page.locator(selectors[0])
-    for s in selectors[1:]:
-        loc = loc.or_(page.locator(s))
-    try:
-        await loc.first.wait_for(state="visible", timeout=timeout)
-        for s in selectors:
-            el = page.locator(s).first
-            if await el.is_visible():
-                await el.click(timeout=3000)
-                return True
-    except (PlaywrightTimeoutError, PlaywrightError):
-        pass
+
+    deadline = time.time() + (timeout / 1000)
+    while time.time() < deadline:
+        for selector in selectors:
+            loc = page.locator(selector)
+            try:
+                count = min(await loc.count(), 5)
+                candidates = [loc.nth(i) for i in range(count)]
+            except Exception:
+                candidates = [loc.first]
+
+            for el in candidates:
+                try:
+                    if not await el.is_visible(timeout=300):
+                        continue
+                    # JS click bypasses scroll-geometry check on minimised window
+                    try:
+                        await page.evaluate(
+                            "(sel) => { const el = document.querySelector(sel); if (el) { el.focus(); el.click(); } }",
+                            selector,
+                        )
+                    except Exception:
+                        try:
+                            await el.click(timeout=3000)
+                        except (PlaywrightTimeoutError, PlaywrightError):
+                            await el.evaluate("(node) => node.click()")
+                    return True
+                except (PlaywrightTimeoutError, PlaywrightError):
+                    continue
+        await page.wait_for_timeout(300)
     return False
 
 
@@ -259,4 +288,3 @@ async def _open_device_prompt_challenge(page: Any) -> None:
         timeout=8000,
     )
     await _wait_for_navigation(page)
-

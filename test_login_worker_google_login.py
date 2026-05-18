@@ -43,7 +43,46 @@ class _FakeLoginPage:
         self.wait_calls += 1
 
 
+class _FakeNavigationWaitPage:
+    def __init__(self, raise_on_load: bool = False) -> None:
+        self.raise_on_load = raise_on_load
+        self.load_states = []
+        self.timeouts = []
+
+    async def wait_for_load_state(self, state: str, timeout: int) -> None:
+        self.load_states.append((state, timeout))
+        if self.raise_on_load:
+            raise PlaywrightTimeoutError("load state timed out")
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        self.timeouts.append(timeout)
+
+
 class GoogleLoginNavigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wait_for_navigation_uses_domcontentloaded_not_networkidle(self) -> None:
+        page = _FakeNavigationWaitPage()
+
+        await google_login._wait_for_navigation(page)
+
+        self.assertEqual(page.load_states, [("domcontentloaded", 5000)])
+        self.assertNotIn(("networkidle", 5000), page.load_states)
+        self.assertEqual(page.timeouts, [google_login.POST_ACTION_SETTLE_MS])
+
+    async def test_wait_for_navigation_still_settles_after_load_timeout(self) -> None:
+        page = _FakeNavigationWaitPage(raise_on_load=True)
+
+        await google_login._wait_for_navigation(page)
+
+        self.assertEqual(page.load_states, [("domcontentloaded", 5000)])
+        self.assertEqual(page.timeouts, [google_login.POST_ACTION_SETTLE_MS])
+
+    def test_google_login_url_is_well_formed(self) -> None:
+        url = google_login._google_login_url()
+
+        self.assertTrue(url.startswith("https://accounts.google.com/signin/v2/identifier?"))
+        self.assertIn("flowName=GlifWebSignIn", url)
+        self.assertIn("continue=https%3A%2F%2Fone.google.com%2F", url)
+
     async def test_goto_google_login_accepts_rendered_email_page_after_timeout(self) -> None:
         page = _FakeLoginPage(email_visible=True)
 
