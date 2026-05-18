@@ -9,6 +9,8 @@ import time
 from html import escape as html_esc
 from typing import Any
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from .accounts import _refund_job, _update_job_status
 from .browser import (
     _block_heavy_resources,
@@ -115,7 +117,27 @@ async def _do_login_attempt(
                 "PROCESSING",
                 {"progress": 10, "progress_note": "Opening Google login…"},
             )
-            await _goto_google_login(page)
+            await _notify(
+                bot,
+                chat_id,
+                f"🌐 <b>Job {html_esc(job_id)}</b>\n\n"
+                f"<b>Navigating to Google</b>\n"
+                f"Connecting via proxy and opening login page... (this may take up to 60s if the proxy is slow)",
+            )
+            try:
+                await _goto_google_login(page)
+            except PlaywrightTimeoutError:
+                proxy_label = _safe_proxy_label(proxy)
+                logger.warning("[%s] Navigation timeout — proxy unreachable: %s", job_id, proxy_label)
+                await _notify(
+                    bot, chat_id,
+                    f"🔴 <b>Job {html_esc(job_id)}</b>\n\n"
+                    f"<b>Proxy unreachable</b>\n"
+                    f"Could not connect to Google via proxy <code>{html_esc(proxy_label)}</code>.\n"
+                    f"The proxy may be expired, down, or blocking Google.\n\n"
+                    f"⏩ Trying next attempt…",
+                )
+                return ATTEMPT_RETRY
             await _wait_for_navigation(page)
             await _screenshot(page, job_id, "01_landing")
 
@@ -553,6 +575,19 @@ async def _run_login_job(
                     return
                 last_error = "login_flow_failed"
 
+            except PlaywrightTimeoutError as exc:
+                # Navigation-level timeout — likely a dead proxy; give friendly message
+                proxy_label = _safe_proxy_label(proxy)
+                last_error = f"Proxy timeout: {proxy_label}"
+                logger.warning("[%s] attempt %d proxy timeout: %s", job_id, attempt, proxy_label)
+                await _notify(
+                    bot, chat_id,
+                    f"🔴 <b>Job {html_esc(job_id)}</b>\n\n"
+                    f"<b>Attempt {attempt + 1} — Proxy unreachable</b>\n"
+                    f"Proxy: <code>{html_esc(proxy_label)}</code>\n"
+                    f"The proxy could not reach Google in time.\n"
+                    f"Please check that your proxy is active and not expired.",
+                )
             except Exception as exc:
                 last_error = _redact_sensitive(
                     f"{type(exc).__name__}: {exc}",
