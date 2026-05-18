@@ -12,11 +12,28 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from .config import (
     GOOGLE_LOGIN_ATTEMPTS,
     _DEVICE_PROMPT_MARKERS,
+    _NEW_DEVICE_CONFIRM_MARKERS,
     _TRY_ANOTHER_WAY_MARKERS,
     LOGIN_NAVIGATION_TIMEOUT_MS,
     POST_ACTION_SETTLE_MS,
 )
 from .page import _check_markers, _detect_challenge, _page_text
+
+GOOGLE_EMAIL_SELECTORS = [
+    'input[type="email"]',
+    'input[name="identifier"]',
+    'input#identifierId',
+    "#identifierId",
+    'input[autocomplete="username"]',
+    'input[aria-label="Email or phone"]',
+    'input[type="text"][autocomplete="username"]',
+]
+
+GOOGLE_PASSWORD_SELECTORS = [
+    'input[type="password"]',
+    'input[name="Passwd"]',
+    'input[autocomplete="current-password"]',
+]
 
 
 async def _wait_for_navigation(page: Any, timeout: int = 5000) -> None:
@@ -42,8 +59,17 @@ def _google_login_url() -> str:
     # because one.google.com was listed in _is_google_login_success_url().
     #
     # Going straight to accounts.google.com/signin guarantees we always land
-    # on the email-input form, which is the correct starting state.
-    return "https://accounts.google.com/signin/v2/identifier?hl=en"
+    # on the email-input form. The continue URL makes Google complete the
+    # service sign-in against Google One instead of stopping on My Account.
+    query = urlencode(
+        {
+            "continue": "https://one.google.com/",
+            "hl": "en",
+            "flowName": "GlifWebSignIn",
+            "flowEntry": "ServiceLogin",
+        }
+    )
+    return f"https://accounts.google.com/signin/v2/identifier?{query}"
 
 
 async def _goto_google_login(page: Any, attempts: int = GOOGLE_LOGIN_ATTEMPTS) -> None:
@@ -106,12 +132,8 @@ async def _goto_google_login(page: Any, attempts: int = GOOGLE_LOGIN_ATTEMPTS) -
 def _is_google_login_success_url(url: str) -> bool:
     """Return True only when the page has settled on a confirmed logged-in Google URL.
 
-    one.google.com is intentionally EXCLUDED here because the bot now starts
-    navigation at accounts.google.com. After credentials are submitted Google
-    redirects to myaccount.google.com or mail.google.com — those are safe
-    success signals. one.google.com is checked separately by the offer-claim
-    flow using _google_one_authenticated_page() which verifies the Sign-in
-    CTA is absent, preventing false positives on the anonymous plans page.
+    URL-only success is limited to Google account surfaces. Google One needs
+    a content check because its public plans page also lives on one.google.com.
     """
     try:
         parsed = urlparse(url)
@@ -119,8 +141,17 @@ def _is_google_login_success_url(url: str) -> bool:
         return False
 
     host = parsed.netloc.lower()
-    # one.google.com is excluded — see docstring above.
     return host in {"myaccount.google.com", "mail.google.com"}
+
+
+def _is_google_identifier_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    return host == "accounts.google.com" and "signin" in path and "identifier" in path
 
 
 async def _locator_visible(page: Any, selector: str, timeout: int = 300) -> bool:
@@ -210,18 +241,75 @@ async def _find_totp_selector(page: Any, timeout: int = 8000) -> str:
     )
 
 
+async def _dismiss_new_device_confirm(page: Any) -> bool:
+    """Auto-click the confirmation button on Google's new-device sign-in page.
+
+    When Google detects a fresh browser/device it shows an interstitial:
+      "You signed in on Android – Pixel 10 Pro"
+    with buttons like "Yes, it's me", "Yes", or "Continue".
+    Clicking any of these dismisses the page and resumes the flow.
+    Returns True if a button was clicked.
+    """
+    confirm_selectors = [
+        # Most specific first
+        "button:has-text(\"Yes, it's me\")",
+        "[role='button']:has-text(\"Yes, it's me\")",
+        "button:has-text('Yes')",
+        "[role='button']:has-text('Yes')",
+        "button:has-text('Continue')",
+        "[role='button']:has-text('Continue')",
+        "button:has-text('Confirm')",
+        "[role='button']:has-text('Confirm')",
+        # Generic submit as last resort
+        "input[type='submit']",
+    ]
+    return await _click_first_visible(page, confirm_selectors, timeout=4000)
+
+
 async def _google_login_state(page: Any) -> str:
     if _is_google_login_success_url(page.url):
         return "SUCCESS"
+
+    # one.google.com is excluded from _is_google_login_success_url to prevent
+    # false-positives on the anonymous plans page. After credentials are
+    # submitted Google may redirect back to one.google.com (authenticated).
+    # We verify authenticity inline: no "Sign in" CTA + no anonymous markers.
+    # IMPORTANT: check the URL HOST only — not the full URL string, because
+    # the login URL contains continue=https://one.google.com/ in the query.
+    try:
+        _parsed_host = urlparse(page.url).netloc.lower()
+    except Exception:
+        _parsed_host = ""
+    if _parsed_host == "one.google.com" or _parsed_host.endswith(".one.google.com"):
+        _body = await _page_text(page)
+        _ANON_MARKERS = (
+            "choose the google one plan",
+            "all google accounts come with up to 15 gb",
+            "15 gb of storage",
+            "this site uses cookies from google",
+        )
+        _signin_visible = (
+            await _locator_visible(page, "a:has-text('Sign in')", timeout=400)
+            or await _locator_visible(page, "button:has-text('Sign in')", timeout=400)
+            or await _locator_visible(page, "[role='button']:has-text('Sign in')", timeout=400)
+        )
+        if not _signin_visible and not any(m in _body for m in _ANON_MARKERS):
+            return "SUCCESS"
 
     challenge = await _detect_challenge(page)
     if challenge:
         return challenge
 
     text = await _page_text(page)
-    if await _locator_visible(page, 'input[type="email"]') or await _locator_visible(page, "#identifierId"):
+    # Check new-device confirmation BEFORE generic challenge markers
+    # so we can auto-dismiss it in _wait_for_google_login_state.
+    if _check_markers(text, _NEW_DEVICE_CONFIRM_MARKERS):
+        return "NEW_DEVICE_CONFIRM"
+    if _is_google_identifier_url(page.url):
         return "EMAIL"
-    if await _locator_visible(page, 'input[type="password"]'):
+    if any([await _locator_visible(page, selector) for selector in GOOGLE_EMAIL_SELECTORS]):
+        return "EMAIL"
+    if any([await _locator_visible(page, selector) for selector in GOOGLE_PASSWORD_SELECTORS]):
         return "PASSWORD"
     if await _find_totp_selector(page, timeout=1000):
         return "TOTP"
@@ -248,6 +336,14 @@ async def _wait_for_google_login_state(
     }
     while time.time() < deadline:
         state = await _google_login_state(page)
+        # Auto-dismiss Google's "You signed in on Pixel 10 Pro" interstitial.
+        # This page is NOT a terminal state — just click through and keep polling.
+        if state == "NEW_DEVICE_CONFIRM":
+            clicked = await _dismiss_new_device_confirm(page)
+            if clicked:
+                await _wait_for_navigation(page, timeout=8000)
+            await page.wait_for_timeout(700)
+            continue
         if state in wanted or state in terminal:
             return state
         await page.wait_for_timeout(700)

@@ -148,6 +148,19 @@ async def _ensure_google_one_authenticated(page: Any, job_id: str) -> bool:
     return False
 
 
+async def _dismiss_google_one_prompts(page: Any) -> None:
+    """Dismiss non-essential Google One prompts that block offer scanning."""
+    for _ in range(3):
+        clicked = await _click_offer_button(
+            page,
+            ["no thanks", "not now", "dismiss", "skip"],
+            timeout=1500,
+        )
+        if not clicked:
+            return
+        await _wait_for_navigation(page, timeout=5000)
+
+
 # ── marker lists ─────────────────────────────────────────────────────────────
 
 _ALREADY_ACTIVE_MARKERS = [
@@ -573,6 +586,7 @@ async def _claim_pixel_offer(
                 await _notify_photo(bot, chat_id, ss, "Google One sign-in required")
             return OFFER_MANUAL_REQUIRED
 
+        await _dismiss_google_one_prompts(page)
         await _screenshot(page, job_id, "08_one_authenticated")
         body = await _page_body(page)
         state, reason = _classify_offer_state(body, page.url)
@@ -605,6 +619,7 @@ async def _claim_pixel_offer(
 
         try:
             await _goto_one(page, "/settings")
+            await _dismiss_google_one_prompts(page)
             await _screenshot(page, job_id, "09_settings")
             for label in ["Check for offers", "Offers", "Promotions", "Redeem"]:
                 try:
@@ -641,6 +656,7 @@ async def _claim_pixel_offer(
                     except Exception:
                         pass
                     await page.wait_for_timeout(3500)
+                    await _dismiss_google_one_prompts(page)
 
                     body = await _page_body(page)
                     state, reason = _classify_offer_state(body, page.url)
@@ -708,7 +724,7 @@ async def _claim_pixel_offer(
                 await _notify(
                     bot,
                     chat_id,
-                    f"Ã¢Å¡Â Ã¯Â¸Â <b>Job {html_esc(job_id)}</b>\n\n"
+                    f"<b>Job {html_esc(job_id)}</b>\n\n"
                     "<b>Google One sign-in required</b>\n"
                     "Google One opened the public plans page instead of the signed-in offer page.",
                 )

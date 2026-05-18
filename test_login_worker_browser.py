@@ -1,6 +1,7 @@
 import bot.login_worker.browser as browser
 from bot.login_worker.config import (
     ANDROID_DPR,
+    ANDROID_SCREEN,
     ANDROID_USER_AGENT,
     ANDROID_VIEWPORT,
     CLIENT_HINTS_HEADERS,
@@ -30,10 +31,12 @@ class ResourceBlockingTests(unittest.TestCase):
 
 class AndroidProfileTests(unittest.TestCase):
     def test_login_worker_android_constants_come_from_shared_profile(self) -> None:
-        self.assertEqual(ANDROID_USER_AGENT, PIXEL_10_PRO_PROFILE.user_agent)
         self.assertEqual(ANDROID_VIEWPORT, PIXEL_10_PRO_PROFILE.viewport)
+        self.assertEqual(ANDROID_SCREEN, PIXEL_10_PRO_PROFILE.screen)
         self.assertEqual(ANDROID_DPR, PIXEL_10_PRO_PROFILE.device_scale_factor)
         self.assertEqual(CLIENT_HINTS_HEADERS, PIXEL_10_PRO_PROFILE.extra_http_headers)
+        self.assertIn("Pixel 10 Pro", ANDROID_USER_AGENT)
+        self.assertIn("Android 16", ANDROID_USER_AGENT)
 
 
 class BrowserLaunchTests(unittest.IsolatedAsyncioTestCase):
@@ -41,7 +44,11 @@ class BrowserLaunchTests(unittest.IsolatedAsyncioTestCase):
         kwargs = browser._build_android_context_kwargs("147.0.7727.15")
 
         self.assertIn("Chrome/147.0.7727.15", kwargs["user_agent"])
+        self.assertEqual(PIXEL_10_PRO_PROFILE.screen, kwargs["screen"])
+        self.assertIn("Pixel 10 Pro", kwargs["user_agent"])
+        self.assertIn("Android 16", kwargs["user_agent"])
         self.assertIn('"Chromium";v="147"', kwargs["extra_http_headers"]["sec-ch-ua"])
+        self.assertEqual('"Pixel 10 Pro"', kwargs["extra_http_headers"]["sec-ch-ua-model"])
         self.assertIn(
             '"Google Chrome";v="147.0.7727.15"',
             kwargs["extra_http_headers"]["sec-ch-ua-full-version-list"],
@@ -107,6 +114,7 @@ class BrowserLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         context_kwargs = captured["context_kwargs"]
         self.assertIn("Chrome/147.0.7727.15", context_kwargs["user_agent"])
+        self.assertIn("Pixel 10 Pro", context_kwargs["user_agent"])
         self.assertIsNone(captured["launch_kwargs"]["proxy"])
         self.assertIn("navigator, 'webdriver'", captured["init_script"])
         self.assertTrue(captured["closed"])

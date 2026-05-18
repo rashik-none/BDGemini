@@ -1,4 +1,5 @@
 import unittest
+from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -6,12 +7,27 @@ import bot.login_worker.google_login as google_login
 
 
 class _FakeLocator:
-    def __init__(self, visible: bool) -> None:
+    def __init__(self, visible: bool, on_click=None) -> None:
         self.first = self
         self._visible = visible
+        self._on_click = on_click
 
     async def is_visible(self, timeout: int = 0) -> bool:
         return self._visible
+
+    async def count(self) -> int:
+        return 1
+
+    def nth(self, index: int) -> "_FakeLocator":
+        return self
+
+    async def click(self, timeout: int = 0) -> None:
+        if self._on_click:
+            self._on_click()
+
+    async def evaluate(self, script: str) -> None:
+        if self._on_click:
+            self._on_click()
 
     def or_(self, other: "_FakeLocator") -> "_FakeLocator":
         return _FakeLocator(self._visible or other._visible)
@@ -58,6 +74,37 @@ class _FakeNavigationWaitPage:
         self.timeouts.append(timeout)
 
 
+class _FakeNewDeviceConfirmPage:
+    def __init__(self) -> None:
+        self.url = "https://accounts.google.com/signin/v2/challenge"
+        self.clicked = False
+        self.timeouts = []
+
+    async def inner_text(self, selector: str) -> str:
+        if self.clicked:
+            return ""
+        return "You signed in on Pixel 10 Pro. Yes, it's me"
+
+    def locator(self, selector: str) -> _FakeLocator:
+        visible = "Yes" in selector and not self.clicked
+
+        def on_click() -> None:
+            self.clicked = True
+            self.url = "https://one.google.com/"
+
+        return _FakeLocator(visible, on_click=on_click)
+
+    async def evaluate(self, script: str, selector: str) -> None:
+        self.clicked = True
+        self.url = "https://one.google.com/"
+
+    async def wait_for_load_state(self, state: str, timeout: int) -> None:
+        return None
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        self.timeouts.append(timeout)
+
+
 class GoogleLoginNavigationTests(unittest.IsolatedAsyncioTestCase):
     async def test_wait_for_navigation_uses_domcontentloaded_not_networkidle(self) -> None:
         page = _FakeNavigationWaitPage()
@@ -79,7 +126,32 @@ class GoogleLoginNavigationTests(unittest.IsolatedAsyncioTestCase):
     def test_google_login_url_is_well_formed(self) -> None:
         url = google_login._google_login_url()
 
-        self.assertEqual(url, "https://one.google.com/")
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+
+        self.assertEqual(parsed.scheme, "https")
+        self.assertEqual(parsed.netloc, "accounts.google.com")
+        self.assertEqual(parsed.path, "/signin/v2/identifier")
+        self.assertEqual(query["continue"], ["https://one.google.com/"])
+        self.assertEqual(query["hl"], ["en"])
+
+    def test_one_google_redirect_is_not_url_only_success(self) -> None:
+        self.assertFalse(google_login._is_google_login_success_url("https://one.google.com/"))
+
+    def test_accounts_identifier_url_is_email_state(self) -> None:
+        self.assertTrue(
+            google_login._is_google_identifier_url(
+                "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fone.google.com%2F"
+            )
+        )
+
+    async def test_wait_for_state_dismisses_new_device_confirm(self) -> None:
+        page = _FakeNewDeviceConfirmPage()
+
+        state = await google_login._wait_for_google_login_state(page, {"SUCCESS"}, timeout=5000)
+
+        self.assertEqual(state, "SUCCESS")
+        self.assertTrue(page.clicked)
 
     async def test_goto_google_login_accepts_rendered_email_page_after_timeout(self) -> None:
         page = _FakeLoginPage(email_visible=True)

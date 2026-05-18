@@ -11,7 +11,9 @@ LOCAL_INVISIBLE_PLAYWRIGHT_SRC = PROJECT_ROOT / "invisible_playwright" / "src"
 if LOCAL_INVISIBLE_PLAYWRIGHT_SRC.exists() and str(LOCAL_INVISIBLE_PLAYWRIGHT_SRC) not in sys.path:
     sys.path.insert(0, str(LOCAL_INVISIBLE_PLAYWRIGHT_SRC))
 
-from invisible_playwright.device_profiles import get_device_profile
+# Import the singleton constant directly — typed as DeviceProfile (never None),
+# so accessing .user_agent etc. is always safe for the type checker.
+from invisible_playwright.device_profiles import PIXEL_10_PRO
 
 ACCOUNTS_FILE = PROJECT_ROOT / "accounts.json"
 SCREENSHOTS_DIR = PROJECT_ROOT / "screenshots"
@@ -51,17 +53,28 @@ DEBUG_SCREENSHOTS = _bool_env("DEBUG_SCREENSHOTS", default=False)
 BLOCK_HEAVY_RESOURCES = _bool_env("BLOCK_HEAVY_RESOURCES", default=True)
 BLOCK_TRACKERS = _bool_env("BLOCK_TRACKERS", default=True)
 BLOCKED_RESOURCE_TYPES = _csv_env("BLOCKED_RESOURCE_TYPES", ("image", "media", "font"))
+
 # ── Pixel 10 Pro device fingerprint ────────────────────────────────
-# Modern Chrome on Android uses "reduced" User-Agent (Android 10; K)
-# with NO device model.  The real identity is conveyed via Client Hints.
-PIXEL_10_PRO_PROFILE = get_device_profile("pixel_10_pro")
-ANDROID_USER_AGENT = PIXEL_10_PRO_PROFILE.user_agent
-ANDROID_VIEWPORT = dict(PIXEL_10_PRO_PROFILE.viewport)
-ANDROID_DPR = PIXEL_10_PRO_PROFILE.device_scale_factor
+# Keep Pixel 10 Pro in both Client Hints and UA fallback. Google account
+# security prompts may show generic Android if the UA has no model.
+PIXEL_10_PRO_PROFILE = PIXEL_10_PRO
+ANDROID_DEVICE_MODEL = "Google Pixel 10 Pro"
+ANDROID_VERSION = "16"
+ANDROID_BUILD_ID = "BP31.250610.004"
+ANDROID_CHROME_VERSION = "136.0.0.0"
+ANDROID_USER_AGENT: str = (
+    f"Mozilla/5.0 (Linux; Android {ANDROID_VERSION}; "
+    f"{ANDROID_DEVICE_MODEL} Build/{ANDROID_BUILD_ID}) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    f"Chrome/{ANDROID_CHROME_VERSION} Mobile Safari/537.36"
+)
+ANDROID_VIEWPORT: dict[str, int] = dict(PIXEL_10_PRO.viewport)
+ANDROID_SCREEN: dict[str, int] = dict(PIXEL_10_PRO.screen)
+ANDROID_DPR: float = PIXEL_10_PRO.device_scale_factor
 
 # Client Hints that a real Pixel 10 Pro sends.
 # Google reads these to determine device eligibility for offers.
-CLIENT_HINTS_HEADERS = dict(PIXEL_10_PRO_PROFILE.extra_http_headers)
+CLIENT_HINTS_HEADERS: dict[str, str] = dict(PIXEL_10_PRO.extra_http_headers)
 
 # Google error markers we look for after each step
 _WRONG_PASSWORD_MARKERS = [
@@ -106,6 +119,20 @@ _TRY_ANOTHER_WAY_MARKERS = [
     "choose another way",
     "more ways to verify",
 ]
+# Google shows this interstitial when a new device/browser is detected.
+# It contains a "Yes, it's me" / "Continue" button to confirm the login.
+_NEW_DEVICE_CONFIRM_MARKERS = [
+    "signed in on android",
+    "signed in on pixel",
+    "new device sign-in",
+    "new sign-in",
+    "check that it was you",
+    "it's really you",
+    "yes, it's me",
+    "confirm it's you",
+    "recognize this activity",
+    "was this you",
+]
 _PAYMENT_REQUIRED_MARKERS = [
     "payment method",
     "add a payment",
@@ -115,5 +142,3 @@ _PAYMENT_REQUIRED_MARKERS = [
     "review your subscription",
     "subscribe",
 ]
-
-

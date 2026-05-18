@@ -20,9 +20,12 @@ from .browser import (
 )
 from .config import DEVICE_PROMPT_TIMEOUT, GOOGLE_LOGIN_ATTEMPTS, MAX_RETRIES
 from .google_login import (
+    GOOGLE_EMAIL_SELECTORS,
+    GOOGLE_PASSWORD_SELECTORS,
     _click_first_visible,
     _find_totp_selector,
     _goto_google_login,
+    _is_google_identifier_url,
     _is_google_login_success_url,
     _open_device_prompt_challenge,
     _open_totp_challenge,
@@ -31,7 +34,7 @@ from .google_login import (
     _wait_for_visible_selector,
 )
 from .notify import _notify, register_job_message
-from .offer import _claim_pixel_offer
+from .offer import _claim_pixel_offer, _google_one_authenticated_page
 from .page import (
     _detect_challenge,
     _human_type,
@@ -198,6 +201,8 @@ async def _do_login_attempt(
 
             try:
                 login_state = await _wait_for_google_login_state(page, {"EMAIL", "SUCCESS"}, timeout=20000)
+                if _is_google_identifier_url(page.url):
+                    login_state = "EMAIL"
                 logger.info("[%s] email phase state=%s url=%s", job_id, login_state, page.url)
                 if login_state == "SUCCESS":
                     logger.info("[%s] existing Google session detected", job_id)
@@ -213,7 +218,7 @@ async def _do_login_attempt(
                 if login_state == "EMAIL":
                     email_selector = await _wait_for_visible_selector(
                         page,
-                        ['input[type="email"]', "#identifierId"],
+                        GOOGLE_EMAIL_SELECTORS,
                         timeout=20000,
                     )
                     if not email_selector:
@@ -309,7 +314,7 @@ async def _do_login_attempt(
 
                 pwd_selector = await _wait_for_visible_selector(
                     page,
-                    ['input[type="password"]', 'input[name="Passwd"]'],
+                    GOOGLE_PASSWORD_SELECTORS,
                     timeout=20000,
                 )
                 if not pwd_selector:
@@ -550,19 +555,11 @@ async def _do_login_attempt(
                 await _notify(bot, chat_id, prompt_text)
                 await _screenshot(page, job_id, "06_device_prompt")
 
-                # Poll until URL changes or timeout
-                deadline = time.time() + DEVICE_PROMPT_TIMEOUT
-                while time.time() < deadline:
-                    url = page.url
-                    if _is_google_login_success_url(url):
-                        login_state = "SUCCESS"
-                        break
-                    # Also detect if Google gave up
-                    ch = await _detect_challenge(page)
-                    if ch:
-                        login_state = ch
-                        break
-                    await page.wait_for_timeout(3000)
+                login_state = await _wait_for_google_login_state(
+                    page,
+                    {"SUCCESS"},
+                    timeout=DEVICE_PROMPT_TIMEOUT * 1000,
+                )
 
             # ── 5. Result check ────────────────────────────────────────
             if login_state == "UNSAFE_BROWSER":
@@ -574,8 +571,19 @@ async def _do_login_attempt(
             current_url = page.url
             await _screenshot(page, job_id, "07_result")
 
-            if _is_google_login_success_url(current_url):
-                logger.info("[%s] ✓ LOGIN SUCCESS", job_id)
+            # _is_google_login_success_url now excludes one.google.com to avoid
+            # false-positives on the anonymous plans page. After credentials are
+            # submitted, Google may redirect to one.google.com (authenticated),
+            # so we check both paths here. Check HOST only — not full URL string.
+            try:
+                from urllib.parse import urlparse as _urlparse
+                _host = _urlparse(current_url).netloc.lower()
+            except Exception:
+                _host = ""
+            _one_google_host = _host == "one.google.com" or _host.endswith(".one.google.com")
+            _one_authenticated = _one_google_host and await _google_one_authenticated_page(page)
+            if _is_google_login_success_url(current_url) or _one_authenticated:
+                logger.info("[%s] ✓ LOGIN SUCCESS (url=%s)", job_id, current_url)
                 await _notify(
                     bot, chat_id,
                     f"✅ <b>Job {html_esc(job_id)}</b>\n\n"

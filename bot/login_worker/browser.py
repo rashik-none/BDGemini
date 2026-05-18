@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 import re
@@ -15,13 +16,18 @@ from .config import (
     BLOCK_TRACKERS,
     BLOCKED_RESOURCE_TYPES,
     ANDROID_VIEWPORT,
+    ANDROID_SCREEN,
     ANDROID_DPR,
+    ANDROID_BUILD_ID,
+    ANDROID_DEVICE_MODEL,
+    ANDROID_VERSION,
 )
 
 logger = logging.getLogger(__name__)
 
 # ── Pixel 10 Pro identity ────────────────────────────────────────────────────
-# Matches device_profiles.py PIXEL_10_PRO exactly.
+# Uses Pixel 10 Pro geometry/client hints, with model included in UA for
+# Google account device-label fallback.
 _DEFAULT_CHROMIUM_VERSION = "136.0.0.0"
 
 # ── Resource blocking ────────────────────────────────────────────────────────
@@ -81,7 +87,8 @@ def _chrome_major(version: str) -> str:
 def _pixel_android_user_agent(chromium_version: str) -> str:
     version = _normalize_chromium_version(chromium_version)
     return (
-        "Mozilla/5.0 (Linux; Android 10; K) "
+        f"Mozilla/5.0 (Linux; Android {ANDROID_VERSION}; "
+        f"{ANDROID_DEVICE_MODEL} Build/{ANDROID_BUILD_ID}) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         f"Chrome/{version} Mobile Safari/537.36"
     )
@@ -128,6 +135,7 @@ def _build_android_context_kwargs(chromium_version: str) -> dict[str, Any]:
     return {
         "user_agent": _pixel_android_user_agent(chromium_version),
         "viewport": ANDROID_VIEWPORT,
+        "screen": ANDROID_SCREEN,
         "device_scale_factor": ANDROID_DPR,
         "is_mobile": True,
         "has_touch": True,
@@ -222,36 +230,203 @@ async def _launch_android_browser(proxy: dict[str, str] | None):
             proxy=pw_proxy,
         )
         try:
+            chromium_ver = _normalize_chromium_version(browser.version)
+            chrome_major = _chrome_major(chromium_ver)
+            ua = _pixel_android_user_agent(chromium_ver)
+
             context = await browser.new_context(**_build_android_context_kwargs(browser.version))
+
+            # ── CDP: override userAgentMetadata so Chrome itself sends the
+            # correct sec-ch-ua-model in every Client Hints request.
+            # extra_http_headers alone conflicts with Chrome's internal CH
+            # logic — CDP is the authoritative override used by real devices.
+            async def _apply_ua_metadata(page: Any) -> None:
+                try:
+                    cdp = await context.new_cdp_session(page)
+                    await cdp.send("Emulation.setUserAgentOverride", {
+                        "userAgent": ua,
+                        "acceptLanguage": "en-US,en;q=0.9",
+                        "platform": "Linux armv8l",
+                        "userAgentMetadata": {
+                            "brands": [
+                                {"brand": "Chromium",     "version": chrome_major},
+                                {"brand": "Google Chrome","version": chrome_major},
+                                {"brand": "Not-A.Brand",  "version": "99"},
+                            ],
+                            "fullVersionList": [
+                                {"brand": "Chromium",     "version": chromium_ver},
+                                {"brand": "Google Chrome","version": chromium_ver},
+                                {"brand": "Not-A.Brand",  "version": "99.0.0.0"},
+                            ],
+                            "fullVersion":   chromium_ver,
+                            "platform":      "Android",
+                            "platformVersion": "16.0.0",
+                            "architecture":  "arm",
+                            "model":         "Pixel 10 Pro",
+                            "mobile":        True,
+                            "bitness":       "64",
+                            "wow64":         False,
+                        },
+                    })
+                except Exception:
+                    pass  # CDP unavailable — fall back to extra_http_headers
+
+            context.on("page", lambda page: asyncio.ensure_future(_apply_ua_metadata(page)))
+
             await context.add_init_script("""
-                // Remove webdriver flag
+                // ── 1. Remove automation traces ───────────────────────────
                 Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined,
-                    configurable: true,
+                    get: () => undefined, configurable: true,
                 });
-                // Restore window.chrome (missing in headless)
-                window.chrome = {
-                    runtime: {},
-                    loadTimes: function(){},
-                    csi: function(){},
-                    app: {},
-                };
-                // Plugins (headless has none — spoof empty array)
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [],
-                });
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en'],
-                });
-                // Remove headless-specific properties
                 delete navigator.__proto__.webdriver;
-                // Permissions API — headless returns 'denied' for notifications
-                // Make it return 'default' like a real browser
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) =>
-                    parameters.name === 'notifications'
-                        ? Promise.resolve({ state: 'default' })
-                        : originalQuery(parameters);
+
+                // ── 2. window.chrome (missing in headless) ────────────────
+                window.chrome = {
+                    runtime: {
+                        id: undefined,
+                        connect: function(){},
+                        sendMessage: function(){},
+                    },
+                    loadTimes: function(){ return {}; },
+                    csi: function(){ return {}; },
+                    app: { isInstalled: false, InstallState: {}, RunningState: {} },
+                };
+
+                // ── 3. navigator.platform → Android ARM ──────────────────
+                Object.defineProperty(navigator, 'platform', {
+                    get: () => 'Linux armv8l', configurable: true,
+                });
+
+                // ── 4. navigator.vendor ───────────────────────────────────
+                Object.defineProperty(navigator, 'vendor', {
+                    get: () => 'Google Inc.', configurable: true,
+                });
+
+                // ── 5. Hardware / memory ──────────────────────────────────
+                Object.defineProperty(navigator, 'hardwareConcurrency', {
+                    get: () => 8, configurable: true,
+                });
+                Object.defineProperty(navigator, 'deviceMemory', {
+                    get: () => 8, configurable: true,
+                });
+
+                // ── 6. Touch ──────────────────────────────────────────────
+                Object.defineProperty(navigator, 'maxTouchPoints', {
+                    get: () => 5, configurable: true,
+                });
+
+                // ── 7. Languages ──────────────────────────────────────────
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'], configurable: true,
+                });
+
+                // ── 8. Plugins (empty on Android Chrome) ──────────────────
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [], configurable: true,
+                });
+
+                // ── 9. Screen geometry (Pixel 10 Pro logical resolution) ──
+                // Physical: 1344×2992 @ 3.25 DPR → logical ≈ 412×919
+                // We match the context viewport exactly.
+                Object.defineProperty(screen, 'width',      { get: () => 410 });
+                Object.defineProperty(screen, 'height',     { get: () => 914 });
+                Object.defineProperty(screen, 'availWidth', { get: () => 410 });
+                Object.defineProperty(screen, 'availHeight',{ get: () => 914 });
+                Object.defineProperty(screen, 'colorDepth', { get: () => 24  });
+                Object.defineProperty(screen, 'pixelDepth', { get: () => 24  });
+
+                // ── 10. Connection API → 4G mobile ────────────────────────
+                try {
+                    const conn = {
+                        effectiveType: '4g',
+                        rtt: 65,
+                        downlink: 18.5,
+                        saveData: false,
+                        type: 'cellular',
+                    };
+                    Object.defineProperty(navigator, 'connection', {
+                        get: () => conn, configurable: true,
+                    });
+                } catch(e) {}
+
+                // ── 11. WebGL → Mali-G715 (Pixel 10 Pro GPU) ─────────────
+                (function() {
+                    const getParameter = WebGLRenderingContext.prototype.getParameter;
+                    WebGLRenderingContext.prototype.getParameter = function(param) {
+                        if (param === 37445) return 'Google Inc. (ARM)';           // VENDOR
+                        if (param === 37446) return 'ANGLE (ARM, Mali-G715, OpenGL ES 3.2)'; // RENDERER
+                        return getParameter.call(this, param);
+                    };
+                    const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+                    WebGL2RenderingContext.prototype.getParameter = function(param) {
+                        if (param === 37445) return 'Google Inc. (ARM)';
+                        if (param === 37446) return 'ANGLE (ARM, Mali-G715, OpenGL ES 3.2)';
+                        return getParameter2.call(this, param);
+                    };
+                })();
+
+                // ── 12. Canvas noise (mild, per-session random) ───────────
+                (function() {
+                    const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
+                    const _getImageData = CanvasRenderingContext2D.prototype.getImageData;
+                    const noise = Math.random() * 0.0003;
+                    HTMLCanvasElement.prototype.toDataURL = function(type) {
+                        const ctx = this.getContext('2d');
+                        if (ctx) {
+                            const img = _getImageData.call(ctx, 0, 0, this.width, this.height);
+                            for (let i = 0; i < img.data.length; i += 4) {
+                                img.data[i]     = Math.min(255, img.data[i]     + (noise * 255 | 0));
+                                img.data[i + 1] = Math.min(255, img.data[i + 1] + (noise * 255 | 0));
+                                img.data[i + 2] = Math.min(255, img.data[i + 2] + (noise * 255 | 0));
+                            }
+                            ctx.putImageData(img, 0, 0);
+                        }
+                        return _toDataURL.apply(this, arguments);
+                    };
+                })();
+
+                // ── 13. AudioContext fingerprint noise ────────────────────
+                (function() {
+                    try {
+                        const _getChannelData = AudioBuffer.prototype.getChannelData;
+                        AudioBuffer.prototype.getChannelData = function() {
+                            const data = _getChannelData.apply(this, arguments);
+                            for (let i = 0; i < data.length; i += 100) {
+                                data[i] += Math.random() * 0.0001 - 0.00005;
+                            }
+                            return data;
+                        };
+                    } catch(e) {}
+                })();
+
+                // ── 14. Battery API → realistic values ────────────────────
+                try {
+                    navigator.getBattery = function() {
+                        return Promise.resolve({
+                            charging: false,
+                            chargingTime: Infinity,
+                            dischargingTime: 14400,
+                            level: 0.72,
+                            addEventListener: function(){},
+                            removeEventListener: function(){},
+                        });
+                    };
+                } catch(e) {}
+
+                // ── 15. Permissions API → mobile-realistic defaults ───────
+                const _origPermQuery = navigator.permissions.query.bind(navigator.permissions);
+                navigator.permissions.query = function(desc) {
+                    if (desc.name === 'notifications')
+                        return Promise.resolve({ state: 'default', onchange: null });
+                    if (desc.name === 'push')
+                        return Promise.resolve({ state: 'denied', onchange: null });
+                    return _origPermQuery(desc);
+                };
+
+                // ── 16. window.chrome runtime messaging ───────────────────
+                if (!window.chrome.runtime.sendMessage) {
+                    window.chrome.runtime.sendMessage = function(){};
+                }
             """)
             # Yield a fake "browser" object whose new_context() returns this context
             # We wrap it so runner.py's `browser.new_context()` call works.
