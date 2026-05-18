@@ -117,26 +117,41 @@ async def _do_login_attempt(
                 "PROCESSING",
                 {"progress": 10, "progress_note": "Opening Google login…"},
             )
+            _conn_note = (
+                f"Connecting via proxy (<code>{html_esc(_safe_proxy_label(proxy))}</code>) and opening login page... (this may take up to 60s)"
+                if proxy
+                else "Connecting directly (no proxy) and opening login page..."
+            )
             await _notify(
                 bot,
                 chat_id,
                 f"🌐 <b>Job {html_esc(job_id)}</b>\n\n"
                 f"<b>Navigating to Google</b>\n"
-                f"Connecting via proxy and opening login page... (this may take up to 60s if the proxy is slow)",
+                f"{_conn_note}",
             )
             try:
                 await _goto_google_login(page)
             except PlaywrightTimeoutError:
                 proxy_label = _safe_proxy_label(proxy)
-                logger.warning("[%s] Navigation timeout — proxy unreachable: %s", job_id, proxy_label)
-                await _notify(
-                    bot, chat_id,
-                    f"🔴 <b>Job {html_esc(job_id)}</b>\n\n"
-                    f"<b>Proxy unreachable</b>\n"
-                    f"Could not connect to Google via proxy <code>{html_esc(proxy_label)}</code>.\n"
-                    f"The proxy may be expired, down, or blocking Google.\n\n"
-                    f"⏩ Trying next attempt…",
-                )
+                logger.warning("[%s] Navigation timeout — proxy=%s", job_id, proxy_label)
+                if proxy:
+                    await _notify(
+                        bot, chat_id,
+                        f"🔴 <b>Job {html_esc(job_id)}</b>\n\n"
+                        f"<b>Proxy unreachable</b>\n"
+                        f"Could not connect to Google via proxy <code>{html_esc(proxy_label)}</code>.\n"
+                        f"The proxy may be expired, down, or blocking Google.\n\n"
+                        f"⏩ Trying next attempt…",
+                    )
+                else:
+                    await _notify(
+                        bot, chat_id,
+                        f"🔴 <b>Job {html_esc(job_id)}</b>\n\n"
+                        f"<b>Navigation timeout</b>\n"
+                        f"Could not reach Google (direct connection timed out).\n"
+                        f"Please check your internet connection.\n\n"
+                        f"⏩ Trying next attempt…",
+                    )
                 return ATTEMPT_RETRY
             await _wait_for_navigation(page)
             await _screenshot(page, job_id, "01_landing")

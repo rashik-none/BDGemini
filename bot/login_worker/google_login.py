@@ -37,21 +37,45 @@ def _google_login_url() -> str:
     return f"https://accounts.google.com/signin/v2/identifier?{query}"
 
 
-async def _goto_google_login(page: Any, attempts: int = 2) -> None:
-    """Open Google's login page with proxy-tolerant navigation handling."""
+async def _goto_google_login(page: Any, attempts: int = 1) -> None:
+    """Open Google's login page with robust navigation handling.
+
+    Strategy:
+      1. Try fast 'commit' (fires as soon as server response bytes arrive).
+         Works even when the full page load is slow or SSL is intercepted.
+      2. If 'commit' times out, try 'domcontentloaded' as a fallback.
+      3. After any successful goto, wait for the email input OR success URL
+         so we know the page is actually usable.
+    """
     url = _google_login_url()
     last_error: Exception | None = None
 
     for attempt in range(attempts):
+        # ── Phase 1: commit (fastest — fires on first response bytes) ──
         try:
             await page.goto(
                 url,
-                wait_until="domcontentloaded",
+                wait_until="commit",
                 timeout=LOGIN_NAVIGATION_TIMEOUT_MS,
             )
-            return
+            # Give the page a moment to start rendering, then check state
+            await page.wait_for_timeout(3000)
+            state = await _google_login_state(page)
+            if state != "UNKNOWN":
+                return
+            # Page committed but content not ready yet — wait a bit more
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=20000)
+            except Exception:
+                pass
+            state = await _google_login_state(page)
+            if state != "UNKNOWN":
+                return
+            # Still unknown — raise to trigger outer retry
+            raise PlaywrightTimeoutError("Page loaded but Google login UI not found")
         except PlaywrightTimeoutError as exc:
             last_error = exc
+            # Check if the page partially loaded anyway
             state = await _google_login_state(page)
             if state != "UNKNOWN":
                 return
