@@ -13,6 +13,8 @@ from playwright.async_api import Error as PlaywrightError
 
 from bot.utils import mask_email as _mask_email  # consolidated; re-exported for login_worker
 
+from .humanize import _dwell_before_action, _simulate_touch
+
 from .config import (
     _ACCOUNT_LOCKED_MARKERS,
     _CAPTCHA_MARKERS,
@@ -123,10 +125,10 @@ def _safe_proxy_label(proxy: dict[str, str] | None) -> str:
 
 
 def _redact_sensitive(text: str, *values: str) -> str:
-    redacted = str(text)
+    redacted = text
     for value in values:
         if value:
-            redacted = redacted.replace(str(value), "[redacted]")
+            redacted = redacted.replace(value, "[redacted]")
     return redacted
 
 
@@ -162,6 +164,10 @@ async def _human_type(page: Any, selector: str, text: str) -> None:
     """
     el = page.locator(selector).first
     await el.wait_for(state="visible", timeout=10000)
+    # Pre-focus dwell — real users pause before tapping an input field
+    await _dwell_before_action(page)
+    # Touch simulation — real mobile users touch the field before typing
+    await _simulate_touch(page, selector)
     # Focus via JS to avoid scroll-geometry failure on minimised window
     try:
         await page.evaluate(
@@ -174,6 +180,8 @@ async def _human_type(page: Any, selector: str, text: str) -> None:
             await el.click(timeout=5000)
         except Exception:
             pass
+    # Brief pause between focus and first keystroke (perception-reaction delay)
+    await page.wait_for_timeout(random.randint(150, 500))
     await el.fill("", timeout=10000)
     await el.type(text, delay=random.randint(40, 120))
     try:

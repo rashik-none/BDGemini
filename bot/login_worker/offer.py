@@ -10,6 +10,7 @@ from urllib.parse import urljoin, urlparse
 from bot.accounts import update_job_status as _update_job_status
 from .config import _PAYMENT_REQUIRED_MARKERS
 from .google_login import _wait_for_navigation
+from .humanize import _dwell_before_action, _human_scroll, _simulate_touch
 from .notify import _notify, _notify_photo
 from .page import _check_markers, _mask_email, _page_text, _redact_sensitive, _screenshot
 
@@ -32,7 +33,10 @@ async def _goto_one(page: Any, path: str = "/") -> None:
     """Navigate to a Google One path and wait for the SPA to settle.
 
     Google One is a React/Angular SPA — it NEVER fires 'networkidle'.
-    We use domcontentloaded + a fixed settle time instead.
+    We use domcontentloaded + a dynamic content-based settle approach:
+      1. Wait for domcontentloaded (or timeout gracefully)
+      2. Poll for meaningful body text up to 8 seconds
+      3. Minimum 2s floor to allow Angular/React hydration
     """
     url = f"https://one.google.com{path}"
     try:
@@ -41,8 +45,19 @@ async def _goto_one(page: Any, path: str = "/") -> None:
         # Timeout on domcontentloaded is common with slow proxies; the page
         # content is usually there anyway.
         pass
-    # Let Angular/React finish rendering its first paint.
-    await page.wait_for_timeout(3500)
+
+    # Dynamic settle: wait until the SPA renders meaningful content
+    # (body text > 50 chars indicates real UI, not just a loader shell)
+    for _ in range(16):  # up to 8 seconds (16 × 500ms)
+        await page.wait_for_timeout(500)
+        try:
+            body_len = await page.evaluate("document.body?.innerText?.length || 0")
+            if body_len > 50:
+                break
+        except Exception:
+            pass
+    # Minimum 1s floor after content detected for hydration
+    await page.wait_for_timeout(1000)
 
 
 async def _page_body(page: Any) -> str:
@@ -148,8 +163,49 @@ async def _ensure_google_one_authenticated(page: Any, job_id: str) -> bool:
     return False
 
 
+async def _dismiss_cookie_consent(page: Any) -> None:
+    """Dismiss EU/GDPR cookie consent banners that overlay offer buttons.
+
+    Google uses several variants across locales:
+      • "Accept all" / "Reject all" buttons
+      • "I agree" / "Agree" on older layouts
+      • consent.google.com iframe
+    """
+    consent_labels = [
+        "accept all", "reject all", "i agree", "agree",
+        "got it", "ok", "accept",
+    ]
+    # Try direct buttons first
+    clicked = await _click_offer_button(page, consent_labels, timeout=2000)
+    if clicked:
+        logger.info("Dismissed cookie consent via '%s'", clicked)
+        await page.wait_for_timeout(1000)
+        return
+
+    # Try consent.google.com iframe (common in EU)
+    try:
+        for frame in page.frames:
+            if "consent.google.com" in (frame.url or ""):
+                for label in consent_labels:
+                    safe_label = label.replace("'", "\\'")
+                    try:
+                        btn = frame.locator(f"button:has-text('{safe_label}')")
+                        if await btn.first.is_visible(timeout=1000):
+                            await btn.first.click()
+                            logger.info("Dismissed cookie consent (iframe) via '%s'", label)
+                            await page.wait_for_timeout(1000)
+                            return
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+
 async def _dismiss_google_one_prompts(page: Any) -> None:
     """Dismiss non-essential Google One prompts that block offer scanning."""
+    # First: cookie consent banners (especially with EU proxies)
+    await _dismiss_cookie_consent(page)
+
     for _ in range(3):
         clicked = await _click_offer_button(
             page,
@@ -461,6 +517,7 @@ async def _click_offer_button(page: Any, labels: list[str], timeout: int = 5000)
       • Google Material Web Components (mwc-button, material-button)
       • Shadow DOM elements (via JS pierce)
       • Elements with aria-label instead of visible text
+      • Pre-click humanization (dwell + touch event)
 
     Returns the label that was clicked, or None.
     """
@@ -480,6 +537,9 @@ async def _click_offer_button(page: Any, labels: list[str], timeout: int = 5000)
         try:
             loc = page.locator(combined).first
             if await loc.is_visible(timeout=timeout):
+                # Humanize: dwell + touch before clicking
+                await _dwell_before_action(page)
+                await _simulate_touch(page, combined.split(", ")[0])
                 await loc.click(timeout=timeout)
                 return label
         except Exception:
@@ -649,17 +709,30 @@ async def _claim_pixel_offer(
 
         # ── Step 3: Try direct offer URLs ──────────────────────────────
         if not offer_found and not signin_required_url:
-            for url in _OFFER_URLS:
+            for url_idx, url in enumerate(_OFFER_URLS):
                 try:
                     try:
                         await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
                     except Exception:
                         pass
-                    await page.wait_for_timeout(3500)
+                    # Dynamic settle — wait for SPA content
+                    for _ in range(12):
+                        await page.wait_for_timeout(500)
+                        try:
+                            body_len = await page.evaluate("document.body?.innerText?.length || 0")
+                            if body_len > 50:
+                                break
+                        except Exception:
+                            pass
+                    await page.wait_for_timeout(1000)
+
                     await _dismiss_google_one_prompts(page)
+                    # Per-URL debug screenshot
+                    await _screenshot(page, job_id, f"09_offer_url_{url_idx}")
 
                     body = await _page_body(page)
                     state, reason = _classify_offer_state(body, page.url)
+                    logger.info("[%s] URL #%d state=%s reason=%s url=%s", job_id, url_idx, state, reason, page.url)
 
                     if state == OFFER_MANUAL_REQUIRED and reason == "google_one_signin_required":
                         signin_required_url = page.url
@@ -799,10 +872,19 @@ async def _claim_pixel_offer(
         for step in range(6):   # up to 6 button screens
             body = await _page_body(page)
 
+            # Guard: if we somehow landed on the anonymous page, stop
+            if _looks_like_anonymous_google_one_page(body, page.url):
+                logger.warning("[%s] step=%d landed on anonymous page, aborting", job_id, step)
+                break
+
             # Build button label list for this step
             labels = list(_OFFER_BUTTON_MARKERS)
             if _looks_like_offer_page(body, page.url):
                 labels.extend(_OFFER_FOLLOWUP_BUTTON_MARKERS)
+
+            # Scroll down slightly before clicking (real users scroll to see buttons)
+            await _human_scroll(page, "down")
+            await _dwell_before_action(page)
 
             clicked_label = await _click_offer_button(page, labels, timeout=4000)
             if clicked_label:

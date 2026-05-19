@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
-
 from html import escape
+
 from telegram import Update
 from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.ext import ContextTypes
@@ -19,7 +18,6 @@ from bot.accounts import (
     balance_credit,
     charge_account,
     create_job,
-    default_account,
     get_account,
     list_account_ids,
     recent_jobs,
@@ -30,7 +28,6 @@ from bot.accounts import (
     update_job_status,
 )
 from bot.config import ADMIN_USER_IDS, VERIFY_PRICE
-from bot.utils import mask_email, user_identity
 from bot.ui import (
     admin_broadcast_prompt,
     admin_confirm_refund_keyboard,
@@ -44,7 +41,6 @@ from bot.ui import (
     admin_users_message,
     balance_message,
     cancel_keyboard,
-    create_verify_message,
     job_detail_keyboard,
     job_detail_message,
     main_keyboard,
@@ -54,12 +50,13 @@ from bot.ui import (
     recent_jobs_keyboard,
     recent_jobs_message,
     ref_keyboard,
-    referral_message,
     referral_invite_link,
+    referral_message,
     simple_page,
     start_message,
     topup_message,
 )
+from bot.utils import user_identity
 
 
 logger = logging.getLogger(__name__)
@@ -86,18 +83,18 @@ VERIFY_METHODS = {
     "verify_method_signin": "Verify sign-in",
 }
 STATIC_PAGES = {
-    "pricing": ("🏷️ Pricing", f"Verify price: {VERIFY_PRICE} credit/job"),
+    "pricing": ("Pricing", f"Verify price: {VERIFY_PRICE} credit per job."),
     "guide": (
-        "🇧🇩 Guide",
-        "Use a real Gmail address, keep inbox and recovery access ready, then "
-        "create a verify job. For Verify sign-in, keep the signed-in device "
-        "online so it can receive the prompt.",
+        "Guide",
+        "Pre-check before starting:\n"
+        "- Gmail account is accessible\n"
+        "- Correct password is ready\n"
+        "- Recovery or verification device is available\n"
+        "- For Verify sign-in, the signed-in device is online\n"
+        "- For 2FA Secret, the base32 secret is valid",
     ),
-    "language": ("🌐 Language", "Current language: English"),
+    "language": ("Language", "Current language: English."),
 }
-
-
-# ── Helpers ──────────────────────────────────────────────────────────
 
 
 async def edit_message(query, text: str, reply_markup) -> None:
@@ -126,13 +123,130 @@ def clear_input_state(context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data.pop(key, None)
 
 
-async def delete_sensitive_message(update: Update) -> None:
-    if not update.effective_message:
+async def delete_user_input_message(update: Update) -> None:
+    message = update.effective_message
+    if not message:
         return
     try:
-        await update.effective_message.delete()
+        await message.delete()
     except Exception:
-        logger.debug("Could not delete sensitive user message", exc_info=True)
+        logger.debug("Could not delete user input message", exc_info=True)
+
+
+async def start_verify_job(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    account: dict,
+    telegram_id: str,
+    gmail: str,
+    password: str,
+    worker_method: str,
+    persisted_method: str,
+    *,
+    query=None,
+) -> None:
+    chat_id = callback_chat_id(update, query)
+    if chat_id is None:
+        clear_input_state(context)
+        if query:
+            await edit_message(
+                query,
+                "<b>Start Verify</b>\n\nCould not resolve the chat. Please try again.",
+                main_keyboard(),
+            )
+        elif update.effective_message:
+            await update.effective_message.reply_html(
+                "<b>Start Verify</b>\n\nCould not resolve the chat. Please try again.",
+                reply_markup=main_keyboard(),
+            )
+        return
+
+    charged, credit_source, charged_deposit, charged_referral = charge_account(account, VERIFY_PRICE)
+    if not charged:
+        clear_input_state(context)
+        text = "<b>Start Verify</b>\n\n" f"Insufficient balance. You need {VERIFY_PRICE} credit."
+        if query:
+            await edit_message(query, text, main_keyboard())
+        elif update.effective_message:
+            await update.effective_message.reply_html(text, reply_markup=main_keyboard())
+        return
+
+    job = create_job(
+        account,
+        gmail,
+        password,
+        persisted_method,
+        VERIFY_PRICE,
+        credit_source,
+        charged_deposit,
+        charged_referral,
+    )
+    await save_account(telegram_id, account)
+    clear_input_state(context)
+
+    created_text = (
+        "<b>Verify Job Created</b>\n\n"
+        f"<b>Job ID:</b> <code>{escape(str(job['id']))}</code>\n"
+        f"<b>Gmail:</b> <code>{escape(gmail)}</code>\n"
+        f"<b>Method:</b> {escape(persisted_method)}\n"
+        f"<b>Charged:</b> {VERIFY_PRICE} credit\n"
+        f"<b>Queue:</b> {escape(credit_source)}\n\n"
+        "Live tracking is now running."
+    )
+    if query:
+        await edit_message(query, created_text, job_detail_keyboard(str(job["id"])))
+        status_message_id = query.message.message_id if query.message else None
+    else:
+        sent = await update.effective_message.reply_html(
+            created_text,
+            reply_markup=job_detail_keyboard(str(job["id"])),
+        )
+        status_message_id = sent.message_id
+
+    from bot.worker import start_login_job
+
+    try:
+        start_login_job(
+            gmail=gmail,
+            password=password,
+            method=worker_method,
+            job_id=str(job["id"]),
+            telegram_id=telegram_id,
+            bot=context.bot,
+            chat_id=chat_id,
+            message_id=status_message_id,
+        )
+    except RuntimeError as exc:
+        logger.warning("Job %s blocked: %s", job.get("id"), exc)
+        await update_job_status(
+            telegram_id,
+            str(job["id"]),
+            "FAILED",
+            {"progress": 100, "progress_note": str(exc)[:200], "error": "blocked"},
+        )
+        await refund_job(telegram_id, str(job["id"]))
+        fail_text = "<b>Verify Job Failed</b>\n\n" f"{escape(str(exc))}\n\nYour credit has been refunded."
+        if query:
+            await edit_message(query, fail_text, main_keyboard())
+        elif update.effective_message:
+            await update.effective_message.reply_html(fail_text, reply_markup=main_keyboard())
+    except Exception as exc:
+        logger.exception("Failed to schedule login job %s", job.get("id"))
+        await update_job_status(
+            telegram_id,
+            str(job["id"]),
+            "FAILED",
+            {"progress": 100, "progress_note": "Could not start worker", "error": str(exc)[:200]},
+        )
+        await refund_job(telegram_id, str(job["id"]))
+        fail_text = (
+            "<b>Verify Job Failed</b>\n\n"
+            "Could not start the worker. Your credit has been refunded."
+        )
+        if query:
+            await edit_message(query, fail_text, main_keyboard())
+        elif update.effective_message:
+            await update.effective_message.reply_html(fail_text, reply_markup=main_keyboard())
 
 
 def valid_gmail(value: str) -> bool:
@@ -174,8 +288,6 @@ def admin_denied_message(telegram_id: str) -> str:
         f"Allowed admin IDs: <code>{escape(configured)}</code>"
     )
 
-
-# ── /start ───────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message:
@@ -271,7 +383,7 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         target_id = data.removeprefix("admin_user_jobs_")
         account = await get_account(target_id)
         jobs = recent_jobs(account, 10)
-        text = f"<b>📋 User jobs</b>\n\nUser: <code>{escape(target_id)}</code>"
+        text = f"<b>User jobs</b>\n\nUser: <code>{escape(target_id)}</code>"
         if not jobs:
             text += "\n\nNo jobs found."
         await edit_message(query, text, admin_jobs_keyboard(target_id, jobs))
@@ -293,7 +405,7 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         action = "add to" if adding else "remove from"
         await edit_message(
             query,
-            f"<b>💳 Credit</b>\n\nSend amount to {action} <code>{escape(target_id)}</code>.",
+            f"<b>Credit</b>\n\nSend amount to {action} <code>{escape(target_id)}</code>.",
             admin_user_keyboard(target_id, str(target_account.get("status", "active"))),
         )
         return
@@ -313,7 +425,7 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         target_account = await get_account(target_id)
         await edit_message(
             query,
-            f"<b>↩ Refund</b>\n\n{escape(message)}",
+            f"<b>Refund</b>\n\n{escape(message)}",
             admin_jobs_keyboard(target_id, recent_jobs(target_account, 10)),
         )
         return
@@ -324,10 +436,10 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         target_account = await get_account(target_id)
         job = next((j for j in recent_jobs(target_account, 50) if str(j.get("id")) == job_id), None)
         if not job:
-            await edit_message(query, "<b>↩ Refund</b>\n\nJob not found.", admin_keyboard())
+            await edit_message(query, "<b>Refund</b>\n\nJob not found.", admin_keyboard())
             return
         text = (
-            "<b>↩ Refund job?</b>\n\n"
+            "<b>Refund job?</b>\n\n"
             f"User: <code>{escape(target_id)}</code>\n"
             f"Job: <code>{escape(job_id)}</code>\n"
             f"Charged: {int(job.get('charged', 0))} credit\n"
@@ -338,8 +450,6 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     await edit_message(query, "<b>Admin</b>\n\nUnknown action.", admin_keyboard())
 
-
-# ── Callback queries ─────────────────────────────────────────────────
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -371,8 +481,12 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if not gmail:
             clear_input_state(context)
-            await edit_message(query, create_verify_message(), cancel_keyboard())
             context.user_data["awaiting_verify_gmail"] = True
+            await edit_message(
+                query,
+                "<b>✨ Create verify</b>\n\nEnter the Gmail to verify.",
+                cancel_keyboard(),
+            )
             return
 
         if not password:
@@ -384,116 +498,33 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        # ── 2FA method: need TOTP secret before creating job ──────────
         if method_key == "verify_method_2fa":
-            totp_secret = context.user_data.get("verify_totp_secret", "")
+            totp_secret = str(context.user_data.get("verify_totp_secret", "")).strip()
             if not totp_secret:
-                context.user_data["verify_method"] = method_key
                 context.user_data["awaiting_totp_secret"] = True
+                context.user_data["verify_method"] = method_key
                 await edit_message(
                     query,
-                    "<b>✨ Create verify</b>\n\n"
-                    "Enter your <b>2FA / TOTP secret key</b> (base32).\n\n"
-                    "This is the plain-text secret from your authenticator app "
-                    "(not a 6-digit code). It looks like:\n"
+                    "<b>Choose the sign-in verification method.</b>\n\n"
+                    "Send your <b>2FA / TOTP secret</b> in base32 format.\n\n"
+                    "Example:\n"
                     "<code>JBSWY3DPEHPK3PXP</code>",
                     cancel_keyboard(),
                 )
                 return
             worker_method = f"2FA Secret:{totp_secret}"
             persisted_method = "2FA Secret"
-
-        chat_id = callback_chat_id(update, query)
-        if chat_id is None:
-            clear_input_state(context)
-            await edit_message(
-                query,
-                "<b>✨ Create verify</b>\n\nCould not resolve chat. Please try again.",
-                main_keyboard(),
-            )
-            return
-
-        charged, credit_source, charged_deposit, charged_referral = charge_account(account, VERIFY_PRICE)
-        if not charged:
-            clear_input_state(context)
-            await edit_message(
-                query,
-                "<b>✨ Create verify</b>\n\n"
-                f"Insufficient balance. You need {VERIFY_PRICE} credit.",
-                main_keyboard(),
-            )
-            return
-
-        job = create_job(
+        await start_verify_job(
+            update,
+            context,
             account,
+            telegram_id,
             str(gmail),
             str(password),
+            worker_method,
             persisted_method,
-            VERIFY_PRICE,
-            credit_source,
-            charged_deposit,
-            charged_referral,
+            query=query,
         )
-        await save_account(telegram_id, account)
-        clear_input_state(context)
-
-        await edit_message(
-            query,
-            "<b>✨ Create verify</b>\n\n"
-            f"Job {escape(str(job['id']))} created for\n"
-            f"{escape(mask_email(str(gmail)))}.\n"
-            f"{VERIFY_PRICE} credit has been charged.\n"
-            "Realtime tracking is now running.\n\n"
-            f"Queue: {escape(credit_source)}\n"
-            f"You are using the {escape(credit_source)} queue. "
-            "You can create a new job every 5m.",
-            job_detail_keyboard(str(job["id"])),
-        )
-
-        from bot.worker import start_login_job
-        try:
-            start_login_job(
-                gmail=str(gmail),
-                password=str(password),
-                method=worker_method,
-                job_id=str(job["id"]),
-                telegram_id=telegram_id,
-                bot=context.bot,
-                chat_id=chat_id,
-                message_id=query.message.message_id if query.message else None,
-            )
-        except RuntimeError as exc:
-            # Concurrency or duplicate guard from worker.py
-            logger.warning("Job %s blocked: %s", job.get("id"), exc)
-            await update_job_status(
-                telegram_id,
-                str(job["id"]),
-                "FAILED",
-                {"progress": 100, "progress_note": str(exc)[:200], "error": "blocked"},
-            )
-            await refund_job(telegram_id, str(job["id"]))
-            await edit_message(
-                query,
-                "<b>✨ Create verify</b>\n\n"
-                f"⚠️ {escape(str(exc))}\n\n"
-                "↩️ Your credit has been refunded.",
-                main_keyboard(),
-            )
-        except Exception as exc:
-            logger.exception("Failed to schedule login job %s", job.get("id"))
-            await update_job_status(
-                telegram_id,
-                str(job["id"]),
-                "FAILED",
-                {"progress": 100, "progress_note": "Could not start worker", "error": str(exc)[:200]},
-            )
-            await refund_job(telegram_id, str(job["id"]))
-            await edit_message(
-                query,
-                "<b>✨ Create verify</b>\n\n"
-                "Could not start the worker. Your credit has been refunded.",
-                main_keyboard(),
-            )
         return
 
     if query.data.startswith("job_"):
@@ -502,7 +533,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         account = await get_account(telegram_id)
         job = next((item for item in recent_jobs(account, 50) if item.get("id") == job_id), None)
         if not job:
-            await edit_message(query, "<b>📋 Job details</b>\n\nJob not found.", job_detail_keyboard(job_id))
+            await edit_message(query, "<b>Job Details</b>\n\nJob not found.", job_detail_keyboard(job_id))
             return
         await edit_message(query, job_detail_message(job), job_detail_keyboard(job_id))
         return
@@ -523,8 +554,13 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if query.data == "create_verify":
+        clear_input_state(context)
         context.user_data["awaiting_verify_gmail"] = True
-        await edit_message(query, create_verify_message(), cancel_keyboard())
+        await edit_message(
+            query,
+            "<b>✨ Create verify</b>\n\nEnter the Gmail to verify.",
+            cancel_keyboard(),
+        )
         return
 
     if query.data == "recent_jobs":
@@ -547,8 +583,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await edit_message(query, simple_page(title, body), main_keyboard())
 
 
-# ── Free-text input ──────────────────────────────────────────────────
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_message.text:
         return
@@ -559,13 +593,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     account = await get_account(telegram_id)
     text_value = update.effective_message.text
 
-    # ── Admin flows ──────────────────────────────────────────────────
     if is_admin_id(telegram_id) and context.user_data.get("awaiting_admin_lookup"):
         target_id = text_value.strip()
         clear_input_state(context)
         if not target_id.isdigit():
             await update.effective_message.reply_html(
-                "<b>🔎 Lookup user</b>\n\nSend a numeric Telegram ID.",
+                "<b>Lookup user</b>\n\nSend a numeric Telegram ID.",
                 reply_markup=admin_keyboard(),
             )
             return
@@ -582,7 +615,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         amount = parse_positive_credit(text_value)
         if amount is None:
             await update.effective_message.reply_html(
-                "<b>💳 Credit</b>\n\nPlease enter a positive whole amount.",
+                "<b>Credit</b>\n\nPlease enter a positive whole amount.",
                 reply_markup=admin_keyboard(),
             )
             return
@@ -591,13 +624,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         clear_input_state(context)
         if not ok:
             await update.effective_message.reply_html(
-                "<b>💳 Credit</b>\n\nUser not found.",
+                "<b>Credit</b>\n\nUser not found.",
                 reply_markup=admin_keyboard(),
             )
             return
         target_account = await get_account(target_id)
         await update.effective_message.reply_html(
-            f"<b>💳 Credit updated</b>\n\n"
+            f"<b>Credit updated</b>\n\n"
             f"User: <code>{escape(target_id)}</code>\n"
             f"Deposit credit: <b>{new_credit}</b>",
             reply_markup=admin_user_keyboard(target_id, str(target_account.get("status", "active"))),
@@ -609,7 +642,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         clear_input_state(context)
         if not message:
             await update.effective_message.reply_html(
-                "<b>📣 Broadcast</b>\n\nMessage cannot be empty.",
+                "<b>Broadcast</b>\n\nMessage cannot be empty.",
                 reply_markup=admin_keyboard(),
             )
             return
@@ -628,7 +661,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 failed += 1
                 logger.warning("Broadcast failed for %s: %s", target_id, exc)
         await update.effective_message.reply_html(
-            "<b>📣 Broadcast complete</b>\n\n"
+            "<b>Broadcast complete</b>\n\n"
             f"Sent: <b>{sent}</b>\n"
             f"Failed: <b>{failed}</b>",
             reply_markup=admin_keyboard(),
@@ -643,20 +676,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # ── User flows ───────────────────────────────────────────────────
     if context.user_data.get("awaiting_verify_gmail"):
         gmail = text_value.strip().lower()
         if not valid_gmail(gmail):
             await update.effective_message.reply_html(
                 "<b>✨ Create verify</b>\n\n"
-                "Send a valid Gmail address, for example:\n"
-                "<code>name@gmail.com</code>",
+                "Only <code>@gmail.com</code> addresses are supported.",
                 reply_markup=cancel_keyboard(),
             )
             return
         context.user_data["verify_gmail"] = gmail
         context.user_data.pop("awaiting_verify_gmail", None)
         context.user_data["awaiting_verify_password"] = True
+        await delete_user_input_message(update)
         await update.effective_message.reply_html(
             "<b>✨ Create verify</b>\n\nEnter the Gmail password.",
             reply_markup=cancel_keyboard(),
@@ -671,15 +703,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=cancel_keyboard(),
             )
             return
-        await delete_sensitive_message(update)
         context.user_data["verify_password"] = password
         context.user_data.pop("awaiting_verify_password", None)
+        await delete_user_input_message(update)
         await update.effective_message.reply_html(
-            "<b>✨ Create verify</b>\n\n"
-            "Choose the sign-in verification method.\n\n"
-            "If you choose Verify sign-in, the account must already be signed "
-            "in on at least one device, and that device must have internet "
-            "access to receive the Tap Yes/select-number prompt.",
+            "<b>Choose the sign-in verification method.</b>\n\n"
+            "If you choose Verify sign-in, the account must already be signed in on at least one device, "
+            "and that device must have internet access to receive the Tap Yes/select-number prompt.",
             reply_markup=method_keyboard(),
         )
         return
@@ -688,21 +718,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         secret = text_value.strip().replace(" ", "")
         if not secret or not re.fullmatch(r"[A-Z2-7=]+", secret.upper()):
             await update.effective_message.reply_html(
-                "<b>✨ Create verify</b>\n\n"
-                "❌ Invalid TOTP secret. It must be a base32 string, e.g.\n"
+                "<b>Choose the sign-in verification method.</b>\n\n"
+                "Invalid TOTP secret. It must be a base32 string, for example:\n"
                 "<code>JBSWY3DPEHPK3PXP</code>\n\n"
                 "Send the correct secret or press Cancel.",
                 reply_markup=cancel_keyboard(),
             )
             return
-        await delete_sensitive_message(update)
         context.user_data["verify_totp_secret"] = secret.upper()
         context.user_data.pop("awaiting_totp_secret", None)
-        context.user_data.pop("verify_method", None)
+        context.user_data["verify_method"] = "verify_method_2fa"
+        await delete_user_input_message(update)
         await update.effective_message.reply_html(
-            "<b>✨ Create verify</b>\n\n"
-            "✅ TOTP secret saved. Confirm to create the job:",
-            reply_markup=method_keyboard(),
+            "<b>2FA secret saved.</b>\n\nStarting the verify job now.",
+            reply_markup=cancel_keyboard(),
         )
         return
 
@@ -712,7 +741,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     amount = parse_positive_credit(text_value)
     if amount is None:
         await update.effective_message.reply_html(
-            "<b>💰 Top up</b>\n\nPlease enter a positive whole USD amount.",
+            "<b>Top Up Balance</b>\n\nPlease enter a positive whole amount.",
             reply_markup=cancel_keyboard(),
         )
         return
@@ -722,8 +751,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     clear_input_state(context)
 
     await update.effective_message.reply_html(
-        "<b>💰 Top up</b>\n\n"
-        f"Deposit added: <b>{amount} credit</b>\n"
+        "<b>Top Up Balance</b>\n\n"
+        f"Added: <b>{amount} credit</b>\n"
         f"Current balance: <b>{balance_credit(account)} credit</b>",
         reply_markup=main_keyboard(),
     )

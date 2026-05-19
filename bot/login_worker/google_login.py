@@ -17,6 +17,7 @@ from .config import (
     LOGIN_NAVIGATION_TIMEOUT_MS,
     POST_ACTION_SETTLE_MS,
 )
+from .humanize import _dwell_before_action, _simulate_touch
 from .page import _check_markers, _detect_challenge, _page_text
 
 GOOGLE_EMAIL_SELECTORS = [
@@ -210,6 +211,10 @@ async def _click_first_visible(
                 try:
                     if not await el.is_visible(timeout=300):
                         continue
+                    # Pre-click dwell — real users pause before tapping
+                    await _dwell_before_action(page)
+                    # Touch event simulation — must fire before click on mobile
+                    await _simulate_touch(page, selector)
                     # JS click bypasses scroll-geometry check on minimised window
                     try:
                         await page.evaluate(

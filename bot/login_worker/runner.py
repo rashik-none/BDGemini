@@ -19,6 +19,7 @@ from .browser import (
     _random_pause,
 )
 from .config import DEVICE_PROMPT_TIMEOUT, GOOGLE_LOGIN_ATTEMPTS, MAX_RETRIES
+from .humanize import _explore_viewport, _human_scroll, _human_scroll_to_element
 from .google_login import (
     GOOGLE_EMAIL_SELECTORS,
     GOOGLE_PASSWORD_SELECTORS,
@@ -43,7 +44,7 @@ from .page import (
     _safe_proxy_label,
     _screenshot,
 )
-from .proxy import _load_proxy_list, _pick_proxy
+from .proxy import _check_proxy_health, _load_proxy_list, _pick_proxy
 from .totp import _extract_totp_secret, _generate_totp, _is_totp_method
 
 logger = logging.getLogger(__name__)
@@ -177,6 +178,9 @@ async def _do_login_attempt(
                 return _retry(f"Navigation timeout: {proxy_label}")
             await _wait_for_navigation(page)
             await _screenshot(page, job_id, "01_landing")
+
+            # ── 1b. Viewport exploration (look around before acting) ───
+            await _explore_viewport(page)
 
             # ── 2. Email ───────────────────────────────────────────────
             logger.info("[%s] → email", job_id)
@@ -319,6 +323,8 @@ async def _do_login_attempt(
 
                 try:
                     await _random_pause(page, 400, 1000)
+                    # Scroll to password field naturally
+                    await _human_scroll_to_element(page, pwd_selector)
                     await _human_type(page, pwd_selector, password)
                     await _screenshot(page, job_id, "04_password_typed")
 
@@ -451,6 +457,8 @@ async def _do_login_attempt(
                         )
                         return ATTEMPT_TERMINAL
 
+                    # Scroll to TOTP field before typing
+                    await _human_scroll_to_element(page, totp_selector)
                     await _human_type(page, totp_selector, totp_code)
                     submitted = False
                     for next_selector in [
@@ -653,6 +661,22 @@ async def _run_login_job(
     try:
         for attempt in range(MAX_RETRIES + 1):
             proxy = _pick_proxy(proxies, attempt)
+
+            # Fast pre-check: skip dead proxies without waiting 90s
+            if proxy and not await _check_proxy_health(proxy, timeout=3.0):
+                proxy_label = _safe_proxy_label(proxy)
+                last_error = f"Proxy unreachable (health check): {proxy_label}"
+                logger.warning("[%s] attempt %d — proxy health check failed: %s", job_id, attempt, proxy_label)
+                await _notify(
+                    bot, chat_id,
+                    f"🟡 <b>Job {html_esc(job_id)}</b>\n\n"
+                    f"<b>Proxy health check failed</b>\n"
+                    f"Proxy: <code>{html_esc(proxy_label)}</code>\n"
+                    f"Skipping to next attempt.",
+                )
+                if attempt < MAX_RETRIES:
+                    continue
+                break
 
             try:
                 attempt_result = await _do_login_attempt(

@@ -9,6 +9,7 @@ import re
 from contextlib import asynccontextmanager
 from typing import Any
 
+
 from playwright.async_api import ProxySettings, async_playwright
 
 from .config import (
@@ -165,6 +166,304 @@ async def _block_heavy_resources(context: Any) -> None:
     await context.route("**/*", route_handler)
 
 
+# ── Stealth init script builder ──────────────────────────────────────────────
+
+def _build_stealth_init_script() -> str:
+    """Build the JavaScript init script with per-session randomized values.
+
+    Randomized per session:
+      • Battery level (0.15 – 0.95), charging state, charge/discharge times
+      • Connection RTT (20-80ms) and downlink (5-50 Mbps)
+
+    Static values matched to Pixel 10 Pro hardware:
+      • WebGL: PowerVR DXT-48-1536 (Tensor G5)
+      • Screen: 410×914 @ 3.125 DPR
+      • CPU: 8 cores, 8 GB memory
+    """
+    # ── Per-session randomized values ──────────────────────────────────
+    bat_charging = random.choice(["true", "false"])
+    bat_level = round(random.uniform(0.15, 0.95), 2)
+    if bat_charging == "true":
+        bat_charging_time = random.randint(600, 7200)  # 10min – 2hr
+        bat_discharging_time = "Infinity"
+    else:
+        bat_charging_time = "Infinity"
+        bat_discharging_time = random.randint(3600, 28800)  # 1hr – 8hr
+
+    conn_rtt = random.randint(20, 80)
+    conn_downlink = round(random.uniform(5.0, 50.0), 1)
+
+    # Gyroscope — phone held naturally in portrait, upright
+    gyro_alpha = round(random.uniform(0, 360), 1)      # compass heading (any direction)
+    gyro_beta = round(random.uniform(75, 85), 1)        # front/back tilt (upright)
+    gyro_gamma = round(random.uniform(-3, 3), 1)        # left/right tilt (near level)
+
+    dpr = ANDROID_DPR
+
+    return f"""
+        // ── 1. Remove automation traces ───────────────────────────
+        Object.defineProperty(navigator, 'webdriver', {{
+            get: () => undefined, configurable: true,
+        }});
+        delete navigator.__proto__.webdriver;
+
+        // ── 2. window.chrome (missing in headless) ────────────────
+        window.chrome = {{
+            runtime: {{
+                id: undefined,
+                connect: function(){{}},
+                sendMessage: function(){{}},
+            }},
+            loadTimes: function(){{ return {{}}; }},
+            csi: function(){{ return {{}}; }},
+            app: {{ isInstalled: false, InstallState: {{}}, RunningState: {{}} }},
+        }};
+
+        // ── 3. navigator.platform → Android ARM ──────────────────
+        Object.defineProperty(navigator, 'platform', {{
+            get: () => 'Linux armv8l', configurable: true,
+        }});
+
+        // ── 4. navigator.vendor ───────────────────────────────────
+        Object.defineProperty(navigator, 'vendor', {{
+            get: () => 'Google Inc.', configurable: true,
+        }});
+
+        // ── 5. Hardware / memory ──────────────────────────────────
+        Object.defineProperty(navigator, 'hardwareConcurrency', {{
+            get: () => 8, configurable: true,
+        }});
+        Object.defineProperty(navigator, 'deviceMemory', {{
+            get: () => 8, configurable: true,
+        }});
+
+        // ── 6. Touch ──────────────────────────────────────────────
+        Object.defineProperty(navigator, 'maxTouchPoints', {{
+            get: () => 5, configurable: true,
+        }});
+
+        // ── 7. Languages ──────────────────────────────────────────
+        Object.defineProperty(navigator, 'languages', {{
+            get: () => ['en-US', 'en'], configurable: true,
+        }});
+
+        // ── 8. Plugins (empty on Android Chrome) ──────────────────
+        Object.defineProperty(navigator, 'plugins', {{
+            get: () => [], configurable: true,
+        }});
+
+        // ── 9. Screen geometry (Pixel 10 Pro logical resolution) ──
+        Object.defineProperty(screen, 'width',      {{ get: () => 410 }});
+        Object.defineProperty(screen, 'height',     {{ get: () => 914 }});
+        Object.defineProperty(screen, 'availWidth', {{ get: () => 410 }});
+        Object.defineProperty(screen, 'availHeight',{{ get: () => 914 }});
+        Object.defineProperty(screen, 'colorDepth', {{ get: () => 24  }});
+        Object.defineProperty(screen, 'pixelDepth', {{ get: () => 24  }});
+
+        // ── 10. Connection API → mobile (per-session random) ──────
+        try {{
+            const conn = {{
+                effectiveType: '4g',
+                rtt: {conn_rtt},
+                downlink: {conn_downlink},
+                saveData: false,
+                type: 'cellular',
+            }};
+            Object.defineProperty(navigator, 'connection', {{
+                get: () => conn, configurable: true,
+            }});
+        }} catch(e) {{}}
+
+        // ── 11. WebGL → PowerVR DXT-48-1536 (Pixel 10 Pro GPU / Tensor G5) ─
+        (function() {{
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(param) {{
+                if (param === 37445) return 'Google Inc. (Imagination Technologies)';
+                if (param === 37446) return 'ANGLE (Imagination Technologies, PowerVR D-Series DXT-48-1536, OpenGL ES 3.2)';
+                return getParameter.call(this, param);
+            }};
+            const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+            WebGL2RenderingContext.prototype.getParameter = function(param) {{
+                if (param === 37445) return 'Google Inc. (Imagination Technologies)';
+                if (param === 37446) return 'ANGLE (Imagination Technologies, PowerVR D-Series DXT-48-1536, OpenGL ES 3.2)';
+                return getParameter2.call(this, param);
+            }};
+        }})();
+
+        // ── 12. Canvas noise (mild, per-session random) ───────────
+        (function() {{
+            const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
+            const _toBlob    = HTMLCanvasElement.prototype.toBlob;
+            const _getImageData = CanvasRenderingContext2D.prototype.getImageData;
+            const noise = Math.random() * 0.0003;
+
+            function _applyNoise(canvas) {{
+                const ctx = canvas.getContext('2d');
+                if (ctx && canvas.width > 0 && canvas.height > 0) {{
+                    try {{
+                        const img = _getImageData.call(ctx, 0, 0, canvas.width, canvas.height);
+                        for (let i = 0; i < img.data.length; i += 4) {{
+                            img.data[i]     = Math.min(255, img.data[i]     + (noise * 255 | 0));
+                            img.data[i + 1] = Math.min(255, img.data[i + 1] + (noise * 255 | 0));
+                            img.data[i + 2] = Math.min(255, img.data[i + 2] + (noise * 255 | 0));
+                        }}
+                        ctx.putImageData(img, 0, 0);
+                    }} catch(e) {{}}
+                }}
+            }}
+
+            HTMLCanvasElement.prototype.toDataURL = function(type) {{
+                _applyNoise(this);
+                return _toDataURL.apply(this, arguments);
+            }};
+
+            // Patch toBlob() — fingerprinters use both paths
+            HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {{
+                _applyNoise(this);
+                return _toBlob.call(this, callback, type, quality);
+            }};
+        }})();
+
+        // ── 13. AudioContext fingerprint noise ────────────────────
+        (function() {{
+            try {{
+                const _getChannelData = AudioBuffer.prototype.getChannelData;
+                AudioBuffer.prototype.getChannelData = function() {{
+                    const data = _getChannelData.apply(this, arguments);
+                    for (let i = 0; i < data.length; i += 100) {{
+                        data[i] += Math.random() * 0.0001 - 0.00005;
+                    }}
+                    return data;
+                }};
+            }} catch(e) {{}}
+        }})();
+
+        // ── 14. Battery API → per-session realistic values ────────
+        try {{
+            navigator.getBattery = function() {{
+                return Promise.resolve({{
+                    charging: {bat_charging},
+                    chargingTime: {bat_charging_time},
+                    dischargingTime: {bat_discharging_time},
+                    level: {bat_level},
+                    addEventListener: function(){{}},
+                    removeEventListener: function(){{}},
+                }});
+            }};
+        }} catch(e) {{}}
+
+        // ── 15. Permissions API → mobile-realistic defaults ───────
+        const _origPermQuery = navigator.permissions.query.bind(navigator.permissions);
+        navigator.permissions.query = function(desc) {{
+            if (desc.name === 'notifications')
+                return Promise.resolve({{ state: 'default', onchange: null }});
+            if (desc.name === 'push')
+                return Promise.resolve({{ state: 'denied', onchange: null }});
+            return _origPermQuery(desc);
+        }};
+
+        // ── 16. window.chrome runtime messaging ───────────────────
+        if (!window.chrome.runtime.sendMessage) {{
+            window.chrome.runtime.sendMessage = function(){{}};
+        }}
+
+        // ── 17. Screen orientation (portrait-primary on mobile) ───
+        try {{
+            Object.defineProperty(screen, 'orientation', {{
+                get: () => ({{
+                    type: 'portrait-primary',
+                    angle: 0,
+                    addEventListener: function(){{}},
+                    removeEventListener: function(){{}},
+                    dispatchEvent: function(){{ return true; }},
+                }}),
+                configurable: true,
+            }});
+        }} catch(e) {{}}
+
+        // ── 18. Explicit devicePixelRatio override ────────────────
+        Object.defineProperty(window, 'devicePixelRatio', {{
+            get: () => {dpr},
+            configurable: true,
+        }});
+
+        // ── 19. Gyroscope / DeviceOrientationEvent ────────────────
+        // Real Android phones emit orientation events from the gyroscope.
+        // Headless browsers never fire these — a strong bot signal.
+        // We dispatch periodic events with realistic "phone in hand" values.
+        (function() {{
+            try {{
+                // Simulate a phone held at a slight angle (portrait, upright)
+                const baseAlpha = {gyro_alpha};  // compass heading
+                const baseBeta  = {gyro_beta};   // front/back tilt (upright ~75-85°)
+                const baseGamma = {gyro_gamma};  // left/right tilt (near 0)
+
+                // Fire an initial event
+                window.dispatchEvent(new DeviceOrientationEvent('deviceorientation', {{
+                    alpha: baseAlpha,
+                    beta: baseBeta,
+                    gamma: baseGamma,
+                    absolute: false,
+                }}));
+
+                // Then periodic micro-tremors (real hands shake slightly)
+                setInterval(() => {{
+                    window.dispatchEvent(new DeviceOrientationEvent('deviceorientation', {{
+                        alpha: baseAlpha + (Math.random() - 0.5) * 0.3,
+                        beta:  baseBeta  + (Math.random() - 0.5) * 0.5,
+                        gamma: baseGamma + (Math.random() - 0.5) * 0.2,
+                        absolute: false,
+                    }}));
+                }}, 200 + Math.random() * 100);
+            }} catch(e) {{}}
+        }})();
+
+        // ── 20. Accelerometer / DeviceMotionEvent ─────────────────
+        // Complements gyroscope — real phones report gravity + user motion.
+        (function() {{
+            try {{
+                // Gravity vector for upright portrait: x≈0, y≈9.5, z≈2.5
+                setInterval(() => {{
+                    const evt = new DeviceMotionEvent('devicemotion', {{
+                        accelerationIncludingGravity: {{
+                            x: (Math.random() - 0.5) * 0.1,
+                            y: 9.5 + (Math.random() - 0.5) * 0.15,
+                            z: 2.5 + (Math.random() - 0.5) * 0.1,
+                        }},
+                        acceleration: {{
+                            x: (Math.random() - 0.5) * 0.05,
+                            y: (Math.random() - 0.5) * 0.05,
+                            z: (Math.random() - 0.5) * 0.05,
+                        }},
+                        rotationRate: {{
+                            alpha: (Math.random() - 0.5) * 0.5,
+                            beta:  (Math.random() - 0.5) * 0.5,
+                            gamma: (Math.random() - 0.5) * 0.3,
+                        }},
+                        interval: 16.67,  // ~60 Hz sensor rate
+                    }});
+                    window.dispatchEvent(evt);
+                }}, 200 + Math.random() * 100);
+            }} catch(e) {{}}
+        }})();
+
+        // ── 21. MediaDevices (camera/mic enumeration) ─────────────
+        // Real Pixel 10 Pro has: front camera, rear ultrawide, rear main,
+        // telephoto, and a microphone. Headless Chromium returns empty.
+        try {{
+            const _origEnumDevices = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+            navigator.mediaDevices.enumerateDevices = function() {{
+                return Promise.resolve([
+                    {{ deviceId: '', groupId: 'camera-group-1', kind: 'videoinput', label: '' }},
+                    {{ deviceId: '', groupId: 'camera-group-2', kind: 'videoinput', label: '' }},
+                    {{ deviceId: '', groupId: 'mic-group-1',    kind: 'audioinput', label: '' }},
+                    {{ deviceId: '', groupId: 'speaker-group-1', kind: 'audiooutput', label: '' }},
+                ]);
+            }};
+        }} catch(e) {{}}
+    """
+
+
 # ── Timing helper ────────────────────────────────────────────────────────────
 
 async def _random_pause(page: Any, lo: int = 300, hi: int = 900) -> None:
@@ -267,161 +566,7 @@ async def _launch_android_browser(proxy: dict[str, str] | None):
 
             context.on("page", lambda page: asyncio.ensure_future(_apply_ua_metadata(page)))
 
-            await context.add_init_script("""
-                // ── 1. Remove automation traces ───────────────────────────
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined, configurable: true,
-                });
-                delete navigator.__proto__.webdriver;
-
-                // ── 2. window.chrome (missing in headless) ────────────────
-                window.chrome = {
-                    runtime: {
-                        id: undefined,
-                        connect: function(){},
-                        sendMessage: function(){},
-                    },
-                    loadTimes: function(){ return {}; },
-                    csi: function(){ return {}; },
-                    app: { isInstalled: false, InstallState: {}, RunningState: {} },
-                };
-
-                // ── 3. navigator.platform → Android ARM ──────────────────
-                Object.defineProperty(navigator, 'platform', {
-                    get: () => 'Linux armv8l', configurable: true,
-                });
-
-                // ── 4. navigator.vendor ───────────────────────────────────
-                Object.defineProperty(navigator, 'vendor', {
-                    get: () => 'Google Inc.', configurable: true,
-                });
-
-                // ── 5. Hardware / memory ──────────────────────────────────
-                Object.defineProperty(navigator, 'hardwareConcurrency', {
-                    get: () => 8, configurable: true,
-                });
-                Object.defineProperty(navigator, 'deviceMemory', {
-                    get: () => 8, configurable: true,
-                });
-
-                // ── 6. Touch ──────────────────────────────────────────────
-                Object.defineProperty(navigator, 'maxTouchPoints', {
-                    get: () => 5, configurable: true,
-                });
-
-                // ── 7. Languages ──────────────────────────────────────────
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en'], configurable: true,
-                });
-
-                // ── 8. Plugins (empty on Android Chrome) ──────────────────
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [], configurable: true,
-                });
-
-                // ── 9. Screen geometry (Pixel 10 Pro logical resolution) ──
-                // Physical: 1344×2992 @ 3.25 DPR → logical ≈ 412×919
-                // We match the context viewport exactly.
-                Object.defineProperty(screen, 'width',      { get: () => 410 });
-                Object.defineProperty(screen, 'height',     { get: () => 914 });
-                Object.defineProperty(screen, 'availWidth', { get: () => 410 });
-                Object.defineProperty(screen, 'availHeight',{ get: () => 914 });
-                Object.defineProperty(screen, 'colorDepth', { get: () => 24  });
-                Object.defineProperty(screen, 'pixelDepth', { get: () => 24  });
-
-                // ── 10. Connection API → 5G / LTE mobile ─────────────────
-                try {
-                    const conn = {
-                        effectiveType: '4g',
-                        rtt: 40,
-                        downlink: 35.0,
-                        saveData: false,
-                        type: 'cellular',
-                    };
-                    Object.defineProperty(navigator, 'connection', {
-                        get: () => conn, configurable: true,
-                    });
-                } catch(e) {}
-
-                // ── 11. WebGL → PowerVR DXT-48-1536 (Pixel 10 Pro GPU / Tensor G5) ─
-                (function() {
-                    const getParameter = WebGLRenderingContext.prototype.getParameter;
-                    WebGLRenderingContext.prototype.getParameter = function(param) {
-                        if (param === 37445) return 'Google Inc. (Imagination Technologies)';
-                        if (param === 37446) return 'ANGLE (Imagination Technologies, PowerVR D-Series DXT-48-1536, OpenGL ES 3.2)';
-                        return getParameter.call(this, param);
-                    };
-                    const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-                    WebGL2RenderingContext.prototype.getParameter = function(param) {
-                        if (param === 37445) return 'Google Inc. (Imagination Technologies)';
-                        if (param === 37446) return 'ANGLE (Imagination Technologies, PowerVR D-Series DXT-48-1536, OpenGL ES 3.2)';
-                        return getParameter2.call(this, param);
-                    };
-                })();
-
-                // ── 12. Canvas noise (mild, per-session random) ───────────
-                (function() {
-                    const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
-                    const _getImageData = CanvasRenderingContext2D.prototype.getImageData;
-                    const noise = Math.random() * 0.0003;
-                    HTMLCanvasElement.prototype.toDataURL = function(type) {
-                        const ctx = this.getContext('2d');
-                        if (ctx) {
-                            const img = _getImageData.call(ctx, 0, 0, this.width, this.height);
-                            for (let i = 0; i < img.data.length; i += 4) {
-                                img.data[i]     = Math.min(255, img.data[i]     + (noise * 255 | 0));
-                                img.data[i + 1] = Math.min(255, img.data[i + 1] + (noise * 255 | 0));
-                                img.data[i + 2] = Math.min(255, img.data[i + 2] + (noise * 255 | 0));
-                            }
-                            ctx.putImageData(img, 0, 0);
-                        }
-                        return _toDataURL.apply(this, arguments);
-                    };
-                })();
-
-                // ── 13. AudioContext fingerprint noise ────────────────────
-                (function() {
-                    try {
-                        const _getChannelData = AudioBuffer.prototype.getChannelData;
-                        AudioBuffer.prototype.getChannelData = function() {
-                            const data = _getChannelData.apply(this, arguments);
-                            for (let i = 0; i < data.length; i += 100) {
-                                data[i] += Math.random() * 0.0001 - 0.00005;
-                            }
-                            return data;
-                        };
-                    } catch(e) {}
-                })();
-
-                // ── 14. Battery API → realistic values ────────────────────
-                try {
-                    navigator.getBattery = function() {
-                        return Promise.resolve({
-                            charging: false,
-                            chargingTime: Infinity,
-                            dischargingTime: 14400,
-                            level: 0.72,
-                            addEventListener: function(){},
-                            removeEventListener: function(){},
-                        });
-                    };
-                } catch(e) {}
-
-                // ── 15. Permissions API → mobile-realistic defaults ───────
-                const _origPermQuery = navigator.permissions.query.bind(navigator.permissions);
-                navigator.permissions.query = function(desc) {
-                    if (desc.name === 'notifications')
-                        return Promise.resolve({ state: 'default', onchange: null });
-                    if (desc.name === 'push')
-                        return Promise.resolve({ state: 'denied', onchange: null });
-                    return _origPermQuery(desc);
-                };
-
-                // ── 16. window.chrome runtime messaging ───────────────────
-                if (!window.chrome.runtime.sendMessage) {
-                    window.chrome.runtime.sendMessage = function(){};
-                }
-            """)
+            await context.add_init_script(_build_stealth_init_script())
             # Yield a fake "browser" object whose new_context() returns this context
             # We wrap it so runner.py's `browser.new_context()` call works.
             yield _ContextAsNewContextBrowser(browser, context)
