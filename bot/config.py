@@ -10,7 +10,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_PROJECT_ROOT / "api.env")
 
 # ── Telegram ─────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8957506094:AAFXQfsH88FGPUfQi-Sy3oE9qU5tI7PnX2k")
+BOT_TOKEN = os.getenv("8957506094:AAFXQfsH88FGPUfQi-Sy3oE9qU5tI7PnX2k", "8957506094:AAFXQfsH88FGPUfQi-Sy3oE9qU5tI7PnX2k")
 CHAT_ID = os.getenv("CHAT_ID", "")
 _admin_ids_raw = os.getenv("ADMIN_USER_IDS", "").strip() or "6196481482"
 ADMIN_USER_IDS = {item.strip() for item in _admin_ids_raw.split(",") if item.strip()}
