@@ -102,5 +102,3 @@ async def _notify_photo(bot: Any, chat_id: int, photo_path: str, caption: str) -
     except Exception as exc:
         logger.warning("Failed to send photo to %s: %s", chat_id, exc)
 
-
-#  PAGE HELPERS

@@ -31,9 +31,4 @@ SCREENSHOTS_DIR = _PROJECT_ROOT / "screenshots"
 # Ensure directories exist
 SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-
-def int_env(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
+# int_env is available from bot.utils for callers that need the minimum clamp.

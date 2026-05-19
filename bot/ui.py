@@ -15,6 +15,7 @@ from bot.accounts import (
     total_spent,
 )
 from bot.config import BOT_TITLE, BOT_USERNAME, DEFAULT_NAME, VERIFY_PRICE
+from bot.utils import mask_email, user_identity
 
 
 RECENT_JOB_LIMIT = 10
@@ -32,17 +33,7 @@ def short_text(value: str, limit: int = 18) -> str:
     return value[: limit - 3] + "..."
 
 
-def mask_email(email: str) -> str:
-    email = email.strip()
-    if "@" not in email:
-        return email
-
-    local, domain = email.split("@", 1)
-    if len(local) <= 2:
-        masked_local = local[0] + "*" if local else "*"
-    else:
-        masked_local = f"{local[0]}{'*' * min(len(local) - 2, 5)}{local[-1]}"
-    return f"{masked_local}@{domain}"
+# mask_email is imported from bot.utils and re-exported for backward compat.
 
 
 def status_emoji(status: str) -> str:
@@ -275,7 +266,6 @@ def start_message(update) -> str:
 
 
 def profile_message(update, account: dict) -> str:
-    from bot.handlers import user_identity  # avoid circular
     telegram_id, username = user_identity(update)
 
     return (
@@ -372,7 +362,6 @@ def job_detail_message(job: dict) -> str:
 
 
 def referral_invite_link(update) -> str:
-    from bot.handlers import user_identity
     telegram_id, _ = user_identity(update)
     return f"https://t.me/{BOT_USERNAME}?start=ref_{telegram_id}"
 

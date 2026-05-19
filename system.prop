@@ -1,0 +1,108 @@
+###
+#-#
+###
+
+###
+# begin product/etc/build.prop
+###
+
+# begin common build properties
+
+
+ro.product.device=blazer
+ro.product.model=Pixel 10 Pro
+ro.product.name=blazer
+ro.product.product.brand=google
+ro.product.product.device=blazer
+ro.product.product.model=Pixel 10 Pro
+ro.product.product.name=blazer
+# end common build properties
+
+
+ro.product.bootimage.brand=google
+ro.product.bootimage.device=blazer
+ro.product.bootimage.model=Pixel 10 Pro
+ro.product.bootimage.name=blazer
+
+# end PRODUCT_BOOTIMAGE_PROPERTIES
+
+###
+# end product/etc/build.prop
+###
+
+###
+#-#
+###
+
+###
+# begin vendor/build.prop
+###
+
+# begin common build properties
+
+ro.product.vendor.device=blazer
+ro.product.vendor.model=Pixel 10 Pro
+ro.product.vendor.name=blazer
+
+# end PRODUCT_VENDOR_PROPERTIES
+
+# begin ADDITIONAL_VENDOR_PROPERTIES
+
+# begin PRODUCT_PROPERTY_OVERRIDE
+
+###
+# end vendor/build.prop
+###
+
+###
+#-#
+###
+
+###
+# begin vendor/odm/etc/build.prop
+###
+
+# begin common build properties
+ro.product.odm.brand=google
+ro.product.odm.device=blazer
+ro.product.odm.model=Pixel 10 Pro
+ro.product.odm.name=blazer
+
+###
+# begin system/system/build.prop
+###
+
+# begin common build properties
+ro.product.system.brand=google
+ro.product.system.device=generic
+ro.product.system.model=mainline
+ro.product.system.name=mainline
+# end common build properties
+
+# begin build properties
+
+
+# begin PRODUCT_SYSTEM_PROPERTIES
+#end PRODUCT_SYSTEM_PROPERTIES
+
+###
+# end system/system/build.prop
+###
+
+###
+#-#
+###
+
+###
+# begin system_ext/etc/build.prop
+###
+
+# begin common build properties
+ro.product.system_ext.brand=google
+ro.product.system_ext.device=blazer
+ro.product.system_ext.model=Pixel 10 Pro
+ro.product.system_ext.name=blazer
+
+###
+# end system_ext/etc/build.prop
+###

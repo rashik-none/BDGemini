@@ -30,6 +30,7 @@ from bot.accounts import (
     update_job_status,
 )
 from bot.config import ADMIN_USER_IDS, VERIFY_PRICE
+from bot.utils import mask_email, user_identity
 from bot.ui import (
     admin_broadcast_prompt,
     admin_confirm_refund_keyboard,
@@ -47,7 +48,6 @@ from bot.ui import (
     job_detail_keyboard,
     job_detail_message,
     main_keyboard,
-    mask_email,
     method_keyboard,
     parse_positive_credit,
     profile_message,
@@ -98,20 +98,6 @@ STATIC_PAGES = {
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
-
-def user_identity(update: Update) -> tuple[str, str]:
-    user = update.effective_user
-    telegram_id = str(user.id) if user else os.getenv("TELEGRAM_ID", "0")
-    username = (
-        user.username
-        if user and user.username
-        else (
-            user.first_name
-            if user and user.first_name
-            else os.getenv("TELEGRAM_USERNAME", os.getenv("MOCK_USERNAME", "user"))
-        )
-    )
-    return telegram_id, username
 
 
 async def edit_message(query, text: str, reply_markup) -> None:
@@ -441,6 +427,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         job = create_job(
             account,
             str(gmail),
+            str(password),
             persisted_method,
             VERIFY_PRICE,
             credit_source,
@@ -448,7 +435,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             charged_referral,
         )
         await save_account(telegram_id, account)
-        password_to_use = str(password)
         clear_input_state(context)
 
         await edit_message(
@@ -468,7 +454,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             start_login_job(
                 gmail=str(gmail),
-                password=password_to_use,
+                password=str(password),
                 method=worker_method,
                 job_id=str(job["id"]),
                 telegram_id=telegram_id,

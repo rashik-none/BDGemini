@@ -12,7 +12,7 @@ from typing import Any
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from .accounts import _refund_job, _update_job_status
+from bot.accounts import refund_job as _refund_job, update_job_status as _update_job_status
 from .browser import (
     _block_heavy_resources,
     _launch_android_browser,
@@ -106,11 +106,6 @@ async def _do_login_attempt(
     """Run one login attempt and classify the outcome for the retry loop."""
 
     masked_email = _mask_email(gmail)
-    login_email = gmail
-    login_password = password
-    verification_method = method
-    password = ""
-    method = ""
     proxy_label = _safe_proxy_label(proxy)
     logger.info("[%s] attempt=%d  proxy=%s", job_id, attempt, proxy_label)
     await _notify(
@@ -230,8 +225,7 @@ async def _do_login_attempt(
                         )
                         return _retry("Google email field was not visible")
                     logger.info("[%s] typing email using selector=%s", job_id, email_selector)
-                    await _human_type(page, email_selector, login_email)
-                    login_email = ""
+                    await _human_type(page, email_selector, gmail)
 
                     clicked = await _click_first_visible(
                         page,
@@ -250,10 +244,7 @@ async def _do_login_attempt(
             except Exception as exc:
                 last_error = _redact_sensitive(
                     f"{type(exc).__name__}: {exc}",
-                    gmail,
-                    login_email,
-                    login_password,
-                    verification_method,
+                    gmail, password, method,
                 )
                 logger.warning("[%s] email phase failed: %s", job_id, last_error)
                 await _screenshot(page, job_id, "02_email_error")
@@ -328,8 +319,7 @@ async def _do_login_attempt(
 
                 try:
                     await _random_pause(page, 400, 1000)
-                    await _human_type(page, pwd_selector, login_password)
-                    login_password = ""
+                    await _human_type(page, pwd_selector, password)
                     await _screenshot(page, job_id, "04_password_typed")
 
                     clicked = await _click_first_visible(
@@ -358,10 +348,7 @@ async def _do_login_attempt(
                 except Exception as exc:
                     last_error = _redact_sensitive(
                         f"{type(exc).__name__}: {exc}",
-                        gmail,
-                        login_email,
-                        login_password,
-                        verification_method,
+                        gmail, password, method,
                     )
                     logger.warning("[%s] password phase failed: %s", job_id, last_error)
                     await _screenshot(page, job_id, "05_password_error")
@@ -414,7 +401,7 @@ async def _do_login_attempt(
             )
             if login_state == "SUCCESS":
                 pass
-            elif _is_totp_method(verification_method):
+            elif _is_totp_method(method):
                 logger.info("[%s] → 2FA TOTP", job_id)
                 await _notify(
                     bot, chat_id,
@@ -422,8 +409,7 @@ async def _do_login_attempt(
                     "<b>Waiting for verification</b>\n"
                     "Preparing 2FA code and completing the sign-in step.",
                 )
-                totp_secret = _extract_totp_secret(verification_method)
-                verification_method = ""
+                totp_secret = _extract_totp_secret(method)
                 if not totp_secret:
                     await _update_job_status(
                         telegram_id, job_id, "FAILED",
@@ -449,9 +435,7 @@ async def _do_login_attempt(
                 if totp_found:
                     try:
                         totp_code = _generate_totp(totp_secret)
-                        totp_secret = ""
                     except ValueError as exc:
-                        totp_secret = ""
                         await _update_job_status(
                             telegram_id, job_id, "FAILED",
                             {"progress": 100,
@@ -468,7 +452,6 @@ async def _do_login_attempt(
                         return ATTEMPT_TERMINAL
 
                     await _human_type(page, totp_selector, totp_code)
-                    totp_code = ""
                     submitted = False
                     for next_selector in [
                         "#totpNext",
@@ -499,7 +482,6 @@ async def _do_login_attempt(
                         "2FA code accepted. Checking login result.",
                     )
                 else:
-                    totp_secret = ""
                     await _screenshot(page, job_id, "06_no_totp")
                     await _notify(
                         bot, chat_id,

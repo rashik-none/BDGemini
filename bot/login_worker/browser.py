@@ -178,20 +178,14 @@ async def _random_pause(page: Any, lo: int = 300, hi: int = 900) -> None:
 async def _launch_android_browser(proxy: dict[str, str] | None):
     """Launch standard Playwright Chromium with Pixel 10 Pro mobile emulation.
 
-    DIAGNOSTIC MODE — using standard Playwright instead of invisible_playwright
-    to isolate whether the 'unsafe browser' error is caused by the patched
-    Firefox binary or by the proxy / account itself.
-
     Anti-detection measures applied:
       • --disable-blink-features=AutomationControlled  → navigator.webdriver = false
-      • Pixel 10 Pro UA + Client Hints headers
+      • Pixel 10 Pro UA + Client Hints headers (CDP userAgentMetadata override)
       • Mobile viewport (410×914, DPR 3.125)
       • is_mobile=True, has_touch=True
       • Locale en-US, timezone Asia/Dhaka
       • ignore_https_errors=True  (handles proxy MITM CA)
-
-    TO SWITCH BACK to invisible_playwright, replace this function body with
-    the InvisiblePlaywright launcher in the git history.
+      • Comprehensive init scripts (WebGL, canvas noise, battery, permissions, etc.)
     """
     pw_proxy = _build_playwright_proxy(proxy)
 

@@ -7,7 +7,7 @@ from html import escape as html_esc
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-from .accounts import _update_job_status
+from bot.accounts import update_job_status as _update_job_status
 from .config import _PAYMENT_REQUIRED_MARKERS
 from .google_login import _wait_for_navigation
 from .notify import _notify, _notify_photo

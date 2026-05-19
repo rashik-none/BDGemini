@@ -261,6 +261,7 @@ def charge_account(account: dict, price: int) -> tuple[bool, str, int, int]:
 def create_job(
     account: dict,
     gmail: str,
+    password: str,
     method: str,
     charged: int = 0,
     credit_source: str = "",
@@ -270,6 +271,7 @@ def create_job(
     job: dict[str, Any] = {
         "id": "cm" + uuid.uuid4().hex[:14],
         "gmail": gmail,
+        "password": password,
         "method": method,
         "status": "PENDING",
         "charged": charged,

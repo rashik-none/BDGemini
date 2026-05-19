@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 
 from playwright.async_api import Error as PlaywrightError
 
+from bot.utils import mask_email as _mask_email  # consolidated; re-exported for login_worker
+
 from .config import (
     _ACCOUNT_LOCKED_MARKERS,
     _CAPTCHA_MARKERS,
@@ -96,20 +98,6 @@ async def _mask_sensitive_inputs(page: Any) -> None:
         logger.debug("Sensitive input masking skipped", exc_info=True)
 
 
-def _mask_email(email: str) -> str:
-    email = email.strip()
-    if "@" not in email:
-        return email
-    local, domain = email.split("@", 1)
-    if not local:
-        return f"*@{domain}"
-    if len(local) <= 2:
-        masked_local = local[0] + "*"
-    else:
-        masked_local = f"{local[0]}{'*' * min(len(local) - 2, 5)}{local[-1]}"
-    return f"{masked_local}@{domain}"
-
-
 def _safe_proxy_label(proxy: dict[str, str] | None) -> str:
     if not proxy:
         return "direct"
@@ -163,11 +151,10 @@ async def _human_type(page: Any, selector: str, text: str) -> None:
 
     WHY JS focus() instead of el.click():
     ───────────────────────────────────────
-    InvisiblePlaywright launches Firefox minimised on Windows (hidden desktop).
     Playwright's click() internally scrolls the element into the viewport and
     then re-checks its bounding box. On a minimised/off-screen window the
     geometry check fails with "element is not visible" even though the element
-    is perfectly stable — it's a known Firefox headless-window quirk.
+    is perfectly stable.
 
     Using evaluate() → el.focus() + el.click() bypasses the scroll-geometry
     check entirely and focuses the input directly, which is all we need before
@@ -175,7 +162,7 @@ async def _human_type(page: Any, selector: str, text: str) -> None:
     """
     el = page.locator(selector).first
     await el.wait_for(state="visible", timeout=10000)
-    # Focus via JS to avoid scroll-geometry failure on minimised Firefox window
+    # Focus via JS to avoid scroll-geometry failure on minimised window
     try:
         await page.evaluate(
             "(sel) => { const el = document.querySelector(sel); if (el) { el.focus(); el.click(); } }",

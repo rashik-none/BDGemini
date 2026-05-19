@@ -3,31 +3,44 @@
 from __future__ import annotations
 
 import os
-import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-LOCAL_INVISIBLE_PLAYWRIGHT_SRC = PROJECT_ROOT / "invisible_playwright" / "src"
-if LOCAL_INVISIBLE_PLAYWRIGHT_SRC.exists() and str(LOCAL_INVISIBLE_PLAYWRIGHT_SRC) not in sys.path:
-    sys.path.insert(0, str(LOCAL_INVISIBLE_PLAYWRIGHT_SRC))
+from bot.utils import int_env as _int_env
 
-# Import the singleton constant directly — typed as DeviceProfile (never None),
-# so accessing .user_agent etc. is always safe for the type checker.
-from invisible_playwright.device_profiles import PIXEL_10_PRO
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+@dataclass(frozen=True)
+class DeviceProfile:
+    viewport: dict[str, int]
+    screen: dict[str, int]
+    device_scale_factor: float
+    extra_http_headers: dict[str, str]
+
+
+PIXEL_10_PRO = DeviceProfile(
+    viewport={"width": 410, "height": 914},
+    screen={"width": 410, "height": 914},
+    device_scale_factor=3.125,
+    extra_http_headers={
+        "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"Android"',
+        "sec-ch-ua-platform-version": '"16.0.0"',
+        "sec-ch-ua-model": '"Pixel 10 Pro"',
+        "sec-ch-ua-full-version-list": (
+            '"Chromium";v="136.0.0.0", '
+            '"Google Chrome";v="136.0.0.0", '
+            '"Not-A.Brand";v="99.0.0.0"'
+        ),
+    },
+)
 
 ACCOUNTS_FILE = PROJECT_ROOT / "accounts.json"
 SCREENSHOTS_DIR = PROJECT_ROOT / "screenshots"
 SCREENSHOTS_DIR.mkdir(exist_ok=True)
 
-
-def _int_env(name: str, default: int, minimum: int | None = None) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        value = default
-    if minimum is not None:
-        value = max(minimum, value)
-    return value
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
