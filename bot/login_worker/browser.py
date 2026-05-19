@@ -329,12 +329,12 @@ async def _launch_android_browser(proxy: dict[str, str] | None):
                 Object.defineProperty(screen, 'colorDepth', { get: () => 24  });
                 Object.defineProperty(screen, 'pixelDepth', { get: () => 24  });
 
-                // ── 10. Connection API → 4G mobile ────────────────────────
+                // ── 10. Connection API → 5G / LTE mobile ─────────────────
                 try {
                     const conn = {
                         effectiveType: '4g',
-                        rtt: 65,
-                        downlink: 18.5,
+                        rtt: 40,
+                        downlink: 35.0,
                         saveData: false,
                         type: 'cellular',
                     };
@@ -343,18 +343,18 @@ async def _launch_android_browser(proxy: dict[str, str] | None):
                     });
                 } catch(e) {}
 
-                // ── 11. WebGL → Mali-G715 (Pixel 10 Pro GPU) ─────────────
+                // ── 11. WebGL → PowerVR DXT-48-1536 (Pixel 10 Pro GPU / Tensor G5) ─
                 (function() {
                     const getParameter = WebGLRenderingContext.prototype.getParameter;
                     WebGLRenderingContext.prototype.getParameter = function(param) {
-                        if (param === 37445) return 'Google Inc. (ARM)';           // VENDOR
-                        if (param === 37446) return 'ANGLE (ARM, Mali-G715, OpenGL ES 3.2)'; // RENDERER
+                        if (param === 37445) return 'Google Inc. (Imagination Technologies)';
+                        if (param === 37446) return 'ANGLE (Imagination Technologies, PowerVR D-Series DXT-48-1536, OpenGL ES 3.2)';
                         return getParameter.call(this, param);
                     };
                     const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
                     WebGL2RenderingContext.prototype.getParameter = function(param) {
-                        if (param === 37445) return 'Google Inc. (ARM)';
-                        if (param === 37446) return 'ANGLE (ARM, Mali-G715, OpenGL ES 3.2)';
+                        if (param === 37445) return 'Google Inc. (Imagination Technologies)';
+                        if (param === 37446) return 'ANGLE (Imagination Technologies, PowerVR D-Series DXT-48-1536, OpenGL ES 3.2)';
                         return getParameter2.call(this, param);
                     };
                 })();

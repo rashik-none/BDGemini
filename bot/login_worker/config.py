@@ -70,10 +70,14 @@ BLOCKED_RESOURCE_TYPES = _csv_env("BLOCKED_RESOURCE_TYPES", ("image", "media", "
 # ── Pixel 10 Pro device fingerprint ────────────────────────────────
 # Keep Pixel 10 Pro in both Client Hints and UA fallback. Google account
 # security prompts may show generic Android if the UA has no model.
+#
+# Tensor G5 SoC → GPU: Imagination PowerVR DXT-48-1536
+#   ANGLE WebGL string: "ANGLE (Imagination Technologies, PowerVR D-Series DXT-48-1536, OpenGL ES 3.2)"
+#   (browser.py init script must match this — NOT Mali-G715 which is Tensor G4)
 PIXEL_10_PRO_PROFILE = PIXEL_10_PRO
 ANDROID_DEVICE_MODEL = "Google Pixel 10 Pro"
 ANDROID_VERSION = "16"
-ANDROID_BUILD_ID = "BP31.250610.004"
+ANDROID_BUILD_ID = "CP1A.260505.005"
 ANDROID_CHROME_VERSION = "136.0.0.0"
 ANDROID_USER_AGENT: str = (
     f"Mozilla/5.0 (Linux; Android {ANDROID_VERSION}; "

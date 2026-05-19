@@ -27,6 +27,14 @@ async def _post_init(app: Application) -> None:  # type: ignore[type-arg]
     logging.getLogger(__name__).info("MongoDB ready.")
 
 
+async def _post_shutdown(app: Application) -> None:  # type: ignore[type-arg]
+    """Gracefully cancel all in-flight login jobs on bot shutdown."""
+    from bot.worker import shutdown_all
+    cancelled = await shutdown_all(timeout=15.0)
+    if cancelled:
+        logging.getLogger(__name__).info("Shut down %d active job(s).", cancelled)
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN missing in api.env")
@@ -40,6 +48,7 @@ def main() -> None:
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))

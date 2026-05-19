@@ -462,6 +462,23 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 chat_id=chat_id,
                 message_id=query.message.message_id if query.message else None,
             )
+        except RuntimeError as exc:
+            # Concurrency or duplicate guard from worker.py
+            logger.warning("Job %s blocked: %s", job.get("id"), exc)
+            await update_job_status(
+                telegram_id,
+                str(job["id"]),
+                "FAILED",
+                {"progress": 100, "progress_note": str(exc)[:200], "error": "blocked"},
+            )
+            await refund_job(telegram_id, str(job["id"]))
+            await edit_message(
+                query,
+                "<b>✨ Create verify</b>\n\n"
+                f"⚠️ {escape(str(exc))}\n\n"
+                "↩️ Your credit has been refunded.",
+                main_keyboard(),
+            )
         except Exception as exc:
             logger.exception("Failed to schedule login job %s", job.get("id"))
             await update_job_status(

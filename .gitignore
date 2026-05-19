@@ -18,6 +18,9 @@ api.env
 accounts.json
 screenshots/
 
+# Prop modules (reference only — values are in system.prop)
+Blazer_*/
+
 # IDE
 .vscode/
 .idea/
