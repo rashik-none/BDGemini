@@ -20,7 +20,7 @@ from bot.utils import user_identity
 
 
 RECENT_JOB_LIMIT = 10
-PROGRESS_WIDTH = 10
+PROGRESS_WIDTH = 12
 
 
 def short_text(value: str, limit: int = 18) -> str:
@@ -44,6 +44,24 @@ def status_emoji(status: str) -> str:
         "FAILED": "❌",
         "ERROR": "💥",
     }.get(status.upper(), "❔")
+
+
+def status_label(status: str) -> str:
+    return {
+        "PENDING": "Queued",
+        "RUNNING": "Running",
+        "PROCESSING": "Processing",
+        "LOGIN_OK": "Login OK",
+        "SUCCESS": "Success",
+        "SUCCEEDED": "Success",
+        "COMPLETED": "Completed",
+        "FAILED": "Failed",
+        "ERROR": "Error",
+    }.get(status.upper(), status.replace("_", " ").title())
+
+
+def status_badge(status: str) -> str:
+    return f"{status_emoji(status)} <b>{escape(status_label(status))}</b>"
 
 
 def stage_emoji(stage: str) -> str:
@@ -102,31 +120,54 @@ def progress_line(progress: int) -> str:
 
 def progress_stage(progress: int, status: str) -> str:
     status = status.upper()
+    if status == "LOGIN_OK":
+        return "Login confirmed"
     if status in {"SUCCESS", "SUCCEEDED", "COMPLETED"}:
         return "Completed"
     if status in {"FAILED", "ERROR"}:
         return "Failed"
     if progress < 10:
-        return "Initializing browser"
-    if progress < 20:
-        return "Connecting to proxy"
-    if progress < 30:
+        return "Starting worker"
+    if progress < 25:
         return "Opening login page"
     if progress < 40:
         return "Entering email"
-    if progress < 50:
-        return "Submitting credentials"
     if progress < 60:
-        return "Waiting for verification"
-    if progress < 70:
+        return "Submitting credentials"
+    if progress < 75:
         return "Handling 2FA/challenge"
-    if progress < 80:
-        return "Login confirmed"
     if progress < 90:
-        return "Scanning for offers"
+        return "Login confirmed"
     if progress < 95:
+        return "Scanning for offers"
+    if progress < 100:
         return "Claiming offer"
     return "Finalizing"
+
+
+def progress_flow(progress: int, status: str) -> str:
+    normalized = status.upper()
+    completed = normalized in {"SUCCESS", "SUCCEEDED", "COMPLETED"}
+    failed = normalized in {"FAILED", "ERROR"}
+    steps = [
+        (0, "Browser"),
+        (25, "Login"),
+        (60, "Verify"),
+        (90, "Offer"),
+        (100, "Done"),
+    ]
+
+    parts = []
+    for idx, (start, label) in enumerate(steps):
+        next_start = steps[idx + 1][0] if idx + 1 < len(steps) else 101
+        if completed or progress >= next_start:
+            marker = "●"
+        elif not failed and progress >= start:
+            marker = "◉"
+        else:
+            marker = "○"
+        parts.append(f"{marker} {label}")
+    return " › ".join(parts)
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
@@ -180,7 +221,7 @@ def recent_jobs_keyboard(account: dict) -> InlineKeyboardMarkup:
         status = str(job.get("status", "PENDING")).upper()
         progress = max(0, min(100, safe_int(job.get("progress"))))
         email = short_text(str(job.get("gmail", "unknown")), 18)
-        label = f"{status_emoji(status)} {email} │ {progress}%"
+        label = f"{status_emoji(status)} {progress:>3}% • {email}"
         job_id = job.get("id")
         if job_id:
             rows.append([InlineKeyboardButton(label, callback_data=f"job_{job_id}")])
@@ -385,7 +426,8 @@ def recent_jobs_message(account: dict) -> str:
         "📋 <b>Recent Jobs</b>",
         f"{'━' * 26}",
         "",
-        f"🟢 Running: <b>{running}</b>  │  ✅ Done: <b>{success}</b>  │  ❌ Fail: <b>{failed}</b>",
+        f"🟢 Live <b>{running}</b>  •  ✅ Done <b>{success}</b>  •  ❌ Failed <b>{failed}</b>",
+        "<i>Most active jobs stay at the top.</i>",
         "",
     ]
 
@@ -396,13 +438,14 @@ def recent_jobs_message(account: dict) -> str:
         note = str(job.get("progress_note", "")).strip()
         gmail = str(job.get("gmail", "unknown"))
 
-        lines.append(f"{status_emoji(status)} <code>{escape(gmail)}</code>")
-        lines.append(f"   <code>{progress_line(progress)}</code> {stage_emoji(stage)} {escape(stage)}")
+        lines.append(f"● <code>{escape(gmail)}</code>")
+        lines.append(f"   {status_badge(status)}  •  <b>{progress}%</b>")
+        lines.append(f"   <code>{progress_bar(progress)}</code>  {stage_emoji(stage)} {escape(stage)}")
         if note:
-            lines.append(f"   💬 {escape(short_text(note, 40))}")
+            lines.append(f"   💬 {escape(short_text(note, 52))}")
         lines.append("")
 
-    lines.append("Tap a job below for full details.")
+    lines.append("Tap a job below to open the full status view.")
     return "\n".join(lines).strip()
 
 
@@ -495,7 +538,6 @@ def job_detail_message(job: dict) -> str:
     stage = progress_stage(progress, status)
     method = str(job.get("method", "N/A"))
 
-    # ── Header ────────────────────────────
     if failed:
         headline = "❌ <b>Job Failed</b>"
     elif completed:
@@ -507,49 +549,27 @@ def job_detail_message(job: dict) -> str:
         headline,
         f"{'━' * 28}",
         "",
+        f"{status_badge(status)}  •  {stage_emoji(stage)} <b>{escape(stage)}</b>",
+        f"📊 <b>{progress}% complete</b>",
+        f"<code>{progress_bar(progress)}</code>",
+        f"🧭 <b>Flow:</b> {escape(progress_flow(progress, status))}",
+        "",
     ]
 
-    # ── Progress section ──────────────────
-    lines.append(f"{stage_emoji(stage)} <b>Stage:</b> {escape(stage)}")
-    lines.append(f"📊 <b>Progress:</b> <code>{progress_line(progress)}</code>")
-    lines.append("")
-
-    # ── Timeline: show which stages are done ──
-    timeline_stages = [
-        (10,  "🚀", "Browser"),
-        (20,  "🌐", "Proxy"),
-        (30,  "📧", "Email"),
-        (50,  "🔑", "Password"),
-        (60,  "📡", "Verification"),
-        (80,  "🔐", "Login"),
-        (90,  "🎁", "Offer scan"),
-        (100, "🏁", "Done"),
-    ]
-    timeline_parts = []
-    for threshold, icon, _label in timeline_stages:
-        if progress >= threshold:
-            timeline_parts.append(f"{icon}")
-        else:
-            timeline_parts.append("▫️")
-    lines.append(f"<b>Timeline:</b> {' › '.join(timeline_parts)}")
-    lines.append("")
-
-    # ── Job info section ──────────────────
-    lines.append(f"{'─' * 28}")
     lines.append("📝 <b>Job Details</b>")
+    lines.append(f"{'─' * 28}")
     lines.append("")
-    lines.append(f"   🆔 ID: <code>{escape(str(job.get('id', '')))}</code>")
-    lines.append(f"   📧 Account: <code>{escape(str(job.get('gmail', '')))}</code>")
-    lines.append(f"   🔐 Method: {escape(method)}")
-    lines.append(f"   💳 Charged: {safe_int(job.get('charged'))} credit ({escape(str(job.get('credit_source', 'N/A')))})")
-    lines.append(f"   📊 Status: <code>{escape(status)}</code>")
+    lines.append(f"🆔 <b>ID:</b> <code>{escape(str(job.get('id', '')))}</code>")
+    lines.append(f"📧 <b>Account:</b> <code>{escape(str(job.get('gmail', '')))}</code>")
+    lines.append(f"🔐 <b>Method:</b> {escape(method)}")
+    lines.append(f"💳 <b>Charged:</b> {safe_int(job.get('charged'))} credit ({escape(str(job.get('credit_source', 'N/A')))})")
+    lines.append(f"📌 <b>Raw status:</b> <code>{escape(status)}</code>")
 
-    # ── Offer result section ──────────────
     offer_result = job.get("offer_result", "")
     if offer_result:
         lines.append("")
-        lines.append(f"{'─' * 28}")
         lines.append("🎁 <b>Offer Result</b>")
+        lines.append(f"{'─' * 28}")
         lines.append("")
         offer_icon = {
             "CLAIMED": "🎉", "ALREADY_ACTIVE": "ℹ️",
@@ -560,45 +580,40 @@ def job_detail_message(job: dict) -> str:
         lines.append(f"   {offer_icon} Result: <b>{escape(str(offer_result))}</b>")
         offer_reason = job.get("offer_reason", "")
         if offer_reason:
-            lines.append(f"   💬 Reason: {escape(str(offer_reason))}")
+            lines.append(f"💬 <b>Reason:</b> {escape(str(offer_reason))}")
 
-    # ── Latest update ─────────────────────
     note = job.get("progress_note", "")
     if note:
         lines.append("")
-        lines.append(f"{'─' * 28}")
         lines.append("💬 <b>Latest Update</b>")
-        lines.append(f"   {escape(str(note))}")
+        lines.append(f"{'─' * 28}")
+        lines.append(escape(str(note)))
 
-    # ── Redeem link ───────────────────────
     redeem = job.get("redeem_link", "")
     if redeem:
         lines.append("")
-        lines.append(f"{'─' * 28}")
         lines.append("🔗 <b>Redeem Link</b>")
-        lines.append(f"   {escape(str(redeem))}")
+        lines.append(f"{'─' * 28}")
+        lines.append(escape(str(redeem)))
 
-    # ── Error section ─────────────────────
     error = job.get("error", "")
     if error:
         lines.append("")
-        lines.append(f"{'─' * 28}")
         lines.append("⚠️ <b>Error Details</b>")
-        lines.append(f"   <code>{escape(str(error))}</code>")
+        lines.append(f"{'─' * 28}")
+        lines.append(f"<code>{escape(str(error))}</code>")
         lines.append("")
         lines.append("💡 Fix the issue and retry with a new job.")
 
-    # ── Refund info ───────────────────────
     refunded = job.get("refunded")
     if refunded:
         lines.append("")
         lines.append(f"↩️ <b>Refunded:</b> {safe_int(refunded)} credit")
 
-    # ── Footer ────────────────────────────
     if not completed and not failed:
         lines.append("")
         lines.append(f"{'━' * 28}")
-        lines.append("🔄 Tap <b>Refresh</b> for latest progress.")
+        lines.append("🔄 Tap <b>Refresh</b> for the latest progress.")
 
     return "\n".join(lines)
 

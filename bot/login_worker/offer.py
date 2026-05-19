@@ -172,8 +172,8 @@ async def _dismiss_cookie_consent(page: Any) -> None:
       • consent.google.com iframe
     """
     consent_labels = [
-        "accept all", "reject all", "i agree", "agree",
-        "got it", "ok", "accept",
+        "ok, got it", "got it", "accept all", "reject all", "i agree",
+        "agree", "ok", "accept",
     ]
     # Try direct buttons first
     clicked = await _click_offer_button(page, consent_labels, timeout=2000)
@@ -229,7 +229,6 @@ _ALREADY_ACTIVE_MARKERS = [
     "manage subscription",
     "cancel subscription",
     "cancel plan",
-    "current plan",
     "your plan is active",
 ]
 
