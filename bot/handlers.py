@@ -197,11 +197,21 @@ async def start_verify_job(
         await edit_message(query, created_text, job_detail_keyboard(str(job["id"])))
         status_message_id = query.message.message_id if query.message else None
     else:
-        sent = await update.effective_message.reply_html(
-            created_text,
-            reply_markup=job_detail_keyboard(str(job["id"])),
-        )
-        status_message_id = sent.message_id
+        if update.effective_message:
+            sent = await update.effective_message.reply_html(
+                created_text,
+                reply_markup=job_detail_keyboard(str(job["id"])),
+            )
+            status_message_id = sent.message_id
+        else:
+            # Fallback: effective_message is None (rare edge case)
+            sent = await context.bot.send_message(
+                chat_id=chat_id,
+                text=created_text,
+                parse_mode="HTML",
+                reply_markup=job_detail_keyboard(str(job["id"])),
+            )
+            status_message_id = sent.message_id
 
     from bot.worker import start_login_job
 
@@ -688,9 +698,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data["verify_gmail"] = gmail
         context.user_data.pop("awaiting_verify_gmail", None)
         context.user_data["awaiting_verify_password"] = True
-        await delete_user_input_message(update)
         await update.effective_message.reply_html(
-            "<b>✨ Create verify</b>\n\nEnter the Gmail password.",
+            "<b>✨ Create verify</b>\n\n"
+            f"✅ Gmail: <code>{escape(gmail)}</code>\n\n"
+            "Now enter the Gmail password.",
             reply_markup=cancel_keyboard(),
         )
         return
@@ -705,8 +716,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         context.user_data["verify_password"] = password
         context.user_data.pop("awaiting_verify_password", None)
-        await delete_user_input_message(update)
         await update.effective_message.reply_html(
+            "<b>✨ Create verify</b>\n\n"
+            f"✅ Gmail: <code>{escape(str(context.user_data.get('verify_gmail', '')))}</code>\n"
+            f"✅ Password: <code>{escape(password)}</code>\n\n"
             "<b>Choose the sign-in verification method.</b>\n\n"
             "If you choose Verify sign-in, the account must already be signed in on at least one device, "
             "and that device must have internet access to receive the Tap Yes/select-number prompt.",
@@ -727,11 +740,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         context.user_data["verify_totp_secret"] = secret.upper()
         context.user_data.pop("awaiting_totp_secret", None)
-        context.user_data["verify_method"] = "verify_method_2fa"
-        await delete_user_input_message(update)
-        await update.effective_message.reply_html(
-            "<b>2FA secret saved.</b>\n\nStarting the verify job now.",
-            reply_markup=cancel_keyboard(),
+        gmail = str(context.user_data.get("verify_gmail", ""))
+        password = str(context.user_data.get("verify_password", ""))
+        if not gmail or not password:
+            clear_input_state(context)
+            await update.effective_message.reply_html(
+                "<b>Start Verify</b>\n\nMissing Gmail or password. Please start again.",
+                reply_markup=main_keyboard(),
+            )
+            return
+        await start_verify_job(
+            update,
+            context,
+            account,
+            telegram_id,
+            gmail,
+            password,
+            f"2FA Secret:{secret.upper()}",
+            "2FA Secret",
         )
         return
 

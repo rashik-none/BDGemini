@@ -35,7 +35,7 @@ def short_text(value: str, limit: int = 18) -> str:
 def status_emoji(status: str) -> str:
     return {
         "PENDING": "⏳",
-        "RUNNING": "🔄",
+        "RUNNING": "🟢",
         "PROCESSING": "⚙️",
         "SUCCESS": "✅",
         "SUCCEEDED": "✅",
@@ -44,6 +44,28 @@ def status_emoji(status: str) -> str:
         "FAILED": "❌",
         "ERROR": "💥",
     }.get(status.upper(), "❔")
+
+
+def stage_emoji(stage: str) -> str:
+    """Return a unique emoji for each job stage."""
+    stage_lower = stage.lower()
+    if "start" in stage_lower:
+        return "🚀"
+    if "account" in stage_lower or "check" in stage_lower:
+        return "🔍"
+    if "credential" in stage_lower or "submit" in stage_lower:
+        return "🔑"
+    if "verif" in stage_lower or "wait" in stage_lower:
+        return "📡"
+    if "claim" in stage_lower or "offer" in stage_lower:
+        return "🎁"
+    if "final" in stage_lower:
+        return "🏁"
+    if "complet" in stage_lower:
+        return "✅"
+    if "fail" in stage_lower:
+        return "❌"
+    return "▪️"
 
 
 def parse_positive_credit(value: str) -> int | None:
@@ -84,14 +106,24 @@ def progress_stage(progress: int, status: str) -> str:
         return "Completed"
     if status in {"FAILED", "ERROR"}:
         return "Failed"
-    if progress < 15:
-        return "Starting job"
-    if progress < 35:
-        return "Checking account"
-    if progress < 55:
+    if progress < 10:
+        return "Initializing browser"
+    if progress < 20:
+        return "Connecting to proxy"
+    if progress < 30:
+        return "Opening login page"
+    if progress < 40:
+        return "Entering email"
+    if progress < 50:
         return "Submitting credentials"
-    if progress < 75:
+    if progress < 60:
         return "Waiting for verification"
+    if progress < 70:
+        return "Handling 2FA/challenge"
+    if progress < 80:
+        return "Login confirmed"
+    if progress < 90:
+        return "Scanning for offers"
     if progress < 95:
         return "Claiming offer"
     return "Finalizing"
@@ -146,8 +178,9 @@ def recent_jobs_keyboard(account: dict) -> InlineKeyboardMarkup:
     rows = []
     for job in recent_jobs(account, RECENT_JOB_LIMIT):
         status = str(job.get("status", "PENDING")).upper()
-        email = short_text(str(job.get("gmail", "unknown")), 22)
-        label = f"{status_emoji(status)} {email} | {status}"
+        progress = max(0, min(100, safe_int(job.get("progress"))))
+        email = short_text(str(job.get("gmail", "unknown")), 18)
+        label = f"{status_emoji(status)} {email} │ {progress}%"
         job_id = job.get("id")
         if job_id:
             rows.append([InlineKeyboardButton(label, callback_data=f"job_{job_id}")])
@@ -159,7 +192,10 @@ def recent_jobs_keyboard(account: dict) -> InlineKeyboardMarkup:
 def job_detail_keyboard(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Refresh", callback_data=f"job_{job_id}")],
+            [
+                InlineKeyboardButton("🔄 Refresh", callback_data=f"job_{job_id}"),
+                InlineKeyboardButton("📋 All Jobs", callback_data="recent_jobs"),
+            ],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="back_to_menu")],
         ]
     )
@@ -168,7 +204,7 @@ def job_detail_keyboard(job_id: str) -> InlineKeyboardMarkup:
 def method_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("2FA Secret", callback_data="verify_method_2fa")],
+            [InlineKeyboardButton("🔐 2FA Secret", callback_data="verify_method_2fa")],
             [InlineKeyboardButton("✅ Verify Sign-In", callback_data="verify_method_signin")],
             [InlineKeyboardButton("✖ Cancel", callback_data="back_to_menu")],
         ]
@@ -248,38 +284,56 @@ def start_message(update) -> str:
     )
 
     return (
-        f"<b>{escape(BOT_TITLE)}</b>\n\n"
-        f"Hello {escape(user_name)}.\n\n"
-        "Use the menu below to check your balance, add credit, start a verify "
-        "job, and review recent results.\n\n"
-        "Open Guide once before your first job to prepare the Gmail account.\n\n"
-        f"<b>Current price:</b> {VERIFY_PRICE} credit per job"
+        f"✨ <b>{escape(BOT_TITLE)}</b> ✨\n"
+        f"{'━' * 26}\n\n"
+        f"👋 Hello, <b>{escape(user_name)}</b>!\n\n"
+        "<b>What I can do:</b>\n"
+        "• 🔐 Auto-login to Gmail accounts\n"
+        "• 🎁 Claim Pixel/Gemini offers\n"
+        "• 📊 Track every step in real-time\n\n"
+        f"{'─' * 26}\n"
+        f"💰 <b>Price:</b> {VERIFY_PRICE} credit per job\n"
+        f"{'─' * 26}\n\n"
+        "📖 Open <b>Guide</b> before your first job."
     )
 
 
 def profile_message(update, account: dict) -> str:
     telegram_id, username = user_identity(update)
+    status_text = str(account.get('status', 'active'))
+    status_icon = "🟢" if status_text == "active" else "🔴"
 
     return (
-        "<b>Account Profile</b>\n\n"
-        f"<b>Telegram ID:</b> <code>{escape(telegram_id)}</code>\n"
-        f"<b>Username:</b> @{escape(username.lstrip('@'))}\n"
-        f"<b>Available balance:</b> {balance_credit(account)} credit\n\n"
-        f"Deposit credit: {safe_int(account.get('deposit_credit'))}\n"
-        f"Referral credit: {referral_credit(account)}\n"
-        f"Total deposit: {safe_int(account.get('total_deposit'))} credit\n"
-        f"Total spent: {total_spent(account)} credit\n"
-        f"Status: {escape(str(account.get('status', 'active')))}"
+        "👤 <b>Account Profile</b>\n"
+        f"{'━' * 26}\n\n"
+        f"🆔 <b>Telegram ID:</b> <code>{escape(telegram_id)}</code>\n"
+        f"👤 <b>Username:</b> @{escape(username.lstrip('@'))}\n"
+        f"{status_icon} <b>Status:</b> {escape(status_text)}\n\n"
+        f"{'─' * 26}\n"
+        "💳 <b>Balance Overview</b>\n\n"
+        f"   💰 Available: <b>{balance_credit(account)} credit</b>\n"
+        f"   📥 Deposit:   {safe_int(account.get('deposit_credit'))} credit\n"
+        f"   🎁 Referral:  {referral_credit(account)} credit\n\n"
+        f"{'─' * 26}\n"
+        "📊 <b>Activity</b>\n\n"
+        f"   📥 Total deposited: {safe_int(account.get('total_deposit'))} credit\n"
+        f"   📤 Total spent:     {total_spent(account)} credit"
     )
 
 
 def balance_message(account: dict) -> str:
+    total = balance_credit(account)
+    deposit = safe_int(account.get('deposit_credit'))
+    referral = referral_credit(account)
+
     return (
-        "<b>Balance</b>\n\n"
-        f"<b>Available:</b> {balance_credit(account)} credit\n"
-        f"Deposit: {safe_int(account.get('deposit_credit'))} credit\n"
-        f"Referral: {referral_credit(account)} credit\n\n"
-        f"Verify job price: {VERIFY_PRICE} credit"
+        "💳 <b>Balance</b>\n"
+        f"{'━' * 26}\n\n"
+        f"💰 <b>Available:</b> <b>{total} credit</b>\n\n"
+        f"   📥 Deposit:  {deposit} credit\n"
+        f"   🎁 Referral: {referral} credit\n\n"
+        f"{'─' * 26}\n"
+        f"💲 Verify job price: <b>{VERIFY_PRICE} credit</b>"
     )
 
 
@@ -303,9 +357,15 @@ def create_verify_message() -> str:
 def recent_jobs_message(account: dict) -> str:
     jobs = recent_jobs(account, RECENT_JOB_LIMIT)
     if not jobs:
-        return "<b>Recent Jobs</b>\n\nNo jobs found yet."
+        return (
+            "📋 <b>Recent Jobs</b>\n"
+            f"{'━' * 26}\n\n"
+            "No jobs found yet.\n\n"
+            "Tap <b>Create Verify</b> to start your first job."
+        )
 
     shown = jobs[:RECENT_JOB_LIMIT]
+    # Sort: running jobs first, then by progress descending
     pinned = sorted(
         shown,
         key=lambda job: (
@@ -322,24 +382,27 @@ def recent_jobs_message(account: dict) -> str:
     failed = sum(1 for job in shown if str(job.get("status", "PENDING")).upper() in {"FAILED", "ERROR"})
 
     lines = [
-        "<b>Recent Jobs</b>",
+        "📋 <b>Recent Jobs</b>",
+        f"{'━' * 26}",
         "",
-        f"Showing <b>{len(shown)}</b> latest job(s).",
-        f"Running: <b>{running}</b>  Success: <b>{success}</b>  Failed: <b>{failed}</b>",
+        f"🟢 Running: <b>{running}</b>  │  ✅ Done: <b>{success}</b>  │  ❌ Fail: <b>{failed}</b>",
         "",
     ]
 
     for job in pinned:
         status = str(job.get("status", "PENDING")).upper()
         progress = max(0, min(100, safe_int(job.get("progress"))))
+        stage = progress_stage(progress, status)
         note = str(job.get("progress_note", "")).strip()
-        lines.append(f"{status_emoji(status)} <code>{escape(str(job.get('gmail', 'unknown')))}</code>")
-        detail = f"{escape(status)} • {progress}%"
+        gmail = str(job.get("gmail", "unknown"))
+
+        lines.append(f"{status_emoji(status)} <code>{escape(gmail)}</code>")
+        lines.append(f"   <code>{progress_line(progress)}</code> {stage_emoji(stage)} {escape(stage)}")
         if note:
-            detail += f" • {escape(short_text(note, 34))}"
-        lines.append(detail)
+            lines.append(f"   💬 {escape(short_text(note, 40))}")
         lines.append("")
 
+    lines.append("Tap a job below for full details.")
     return "\n".join(lines).strip()
 
 
@@ -432,46 +495,110 @@ def job_detail_message(job: dict) -> str:
     stage = progress_stage(progress, status)
     method = str(job.get("method", "N/A"))
 
+    # ── Header ────────────────────────────
     if failed:
         headline = "❌ <b>Job Failed</b>"
     elif completed:
         headline = "🎉 <b>Job Completed</b>"
     else:
-        headline = "🔄 <b>Job Running</b>"
+        headline = "🟢 <b>Job Running</b>"
 
     lines = [
         headline,
+        f"{'━' * 28}",
         "",
-        f"<b>Current phase:</b> {escape(stage)}",
-        f"<b>Progress:</b> <code>{progress_line(progress)}</code>",
-        "",
-        f"<b>Status:</b> <code>{escape(status)}</code>",
-        f"<b>Method:</b> {escape(method)}",
-        f"<b>Job ID:</b> <code>{escape(str(job.get('id', '')))}</code>",
-        f"<b>Account:</b> <code>{escape(str(job.get('gmail', '')))}</code>",
-        f"<b>Charged:</b> {safe_int(job.get('charged'))} credit",
-        f"<b>Credit source:</b> {escape(str(job.get('credit_source', 'N/A')))}",
     ]
 
+    # ── Progress section ──────────────────
+    lines.append(f"{stage_emoji(stage)} <b>Stage:</b> {escape(stage)}")
+    lines.append(f"📊 <b>Progress:</b> <code>{progress_line(progress)}</code>")
+    lines.append("")
+
+    # ── Timeline: show which stages are done ──
+    timeline_stages = [
+        (10,  "🚀", "Browser"),
+        (20,  "🌐", "Proxy"),
+        (30,  "📧", "Email"),
+        (50,  "🔑", "Password"),
+        (60,  "📡", "Verification"),
+        (80,  "🔐", "Login"),
+        (90,  "🎁", "Offer scan"),
+        (100, "🏁", "Done"),
+    ]
+    timeline_parts = []
+    for threshold, icon, _label in timeline_stages:
+        if progress >= threshold:
+            timeline_parts.append(f"{icon}")
+        else:
+            timeline_parts.append("▫️")
+    lines.append(f"<b>Timeline:</b> {' › '.join(timeline_parts)}")
+    lines.append("")
+
+    # ── Job info section ──────────────────
+    lines.append(f"{'─' * 28}")
+    lines.append("📝 <b>Job Details</b>")
+    lines.append("")
+    lines.append(f"   🆔 ID: <code>{escape(str(job.get('id', '')))}</code>")
+    lines.append(f"   📧 Account: <code>{escape(str(job.get('gmail', '')))}</code>")
+    lines.append(f"   🔐 Method: {escape(method)}")
+    lines.append(f"   💳 Charged: {safe_int(job.get('charged'))} credit ({escape(str(job.get('credit_source', 'N/A')))})")
+    lines.append(f"   📊 Status: <code>{escape(status)}</code>")
+
+    # ── Offer result section ──────────────
+    offer_result = job.get("offer_result", "")
+    if offer_result:
+        lines.append("")
+        lines.append(f"{'─' * 28}")
+        lines.append("🎁 <b>Offer Result</b>")
+        lines.append("")
+        offer_icon = {
+            "CLAIMED": "🎉", "ALREADY_ACTIVE": "ℹ️",
+            "NOT_ELIGIBLE": "⚠️", "NOT_FOUND": "🔍",
+            "PAYMENT_REQUIRED": "💳", "MANUAL_REQUIRED": "✋",
+            "CLAIM_FAILED": "❌", "CLAIMABLE": "✨",
+        }.get(str(offer_result).upper(), "❔")
+        lines.append(f"   {offer_icon} Result: <b>{escape(str(offer_result))}</b>")
+        offer_reason = job.get("offer_reason", "")
+        if offer_reason:
+            lines.append(f"   💬 Reason: {escape(str(offer_reason))}")
+
+    # ── Latest update ─────────────────────
     note = job.get("progress_note", "")
     if note:
-        lines.extend(["", f"<b>Latest update:</b> {escape(str(note))}"])
+        lines.append("")
+        lines.append(f"{'─' * 28}")
+        lines.append("💬 <b>Latest Update</b>")
+        lines.append(f"   {escape(str(note))}")
 
+    # ── Redeem link ───────────────────────
     redeem = job.get("redeem_link", "")
     if redeem:
-        lines.extend(["", f"<b>Redeem link:</b> {escape(str(redeem))}"])
+        lines.append("")
+        lines.append(f"{'─' * 28}")
+        lines.append("🔗 <b>Redeem Link</b>")
+        lines.append(f"   {escape(str(redeem))}")
 
+    # ── Error section ─────────────────────
     error = job.get("error", "")
     if error:
-        lines.extend(["", f"<b>Error:</b> {escape(str(error))}"])
-        lines.extend(["", "Check the latest update, fix the account issue, and retry with a fresh job."])
+        lines.append("")
+        lines.append(f"{'─' * 28}")
+        lines.append("⚠️ <b>Error Details</b>")
+        lines.append(f"   <code>{escape(str(error))}</code>")
+        lines.append("")
+        lines.append("💡 Fix the issue and retry with a new job.")
 
+    # ── Refund info ───────────────────────
     refunded = job.get("refunded")
     if refunded:
-        lines.append(f"<b>Refunded:</b> {safe_int(refunded)} credit")
+        lines.append("")
+        lines.append(f"↩️ <b>Refunded:</b> {safe_int(refunded)} credit")
 
+    # ── Footer ────────────────────────────
     if not completed and not failed:
-        lines.extend(["", "Tap Refresh to load the latest progress."])
+        lines.append("")
+        lines.append(f"{'━' * 28}")
+        lines.append("🔄 Tap <b>Refresh</b> for latest progress.")
 
     return "\n".join(lines)
 
